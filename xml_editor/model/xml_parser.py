@@ -1,0 +1,802 @@
+"""
+XML解析器
+
+处理MJCF文件的加载、解析和保存功能。
+"""
+
+import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import tostring, fromstring
+from xml.dom import minidom
+import numpy as np
+from .geometry import Geometry, GeometryGroup, GeometryType
+
+class XMLParser:
+    """
+    XML文件解析和生成工具
+    
+    用于处理MJCF场景的加载和保存，支持两种格式：
+    1. 增强XML格式（自定义格式，更适合编辑器内部使用）
+    2. MuJoCo XML格式（标准MJCF格式）
+    """
+    # 在类作用域里新增一个类变量，用来暂存“最近一次加载的 MJCF 根节点”（深拷贝）
+    _last_loaded_mjcf_root = None
+    _last_loaded_angle_mode = "radian"
+    @staticmethod
+    def load(filename):
+        """
+        从XML文件导入几何体和组层级结构
+        
+        参数:
+            filename: 要加载的XML文件路径
+            
+        返回:
+            几何体对象列表
+        """
+        try:
+            tree = ET.parse(filename)
+            root = tree.getroot()
+            
+            # 检查文件格式类型
+            is_mujoco_format = root.tag == "mujoco"
+            # 缓存“原始 MJCF 根节点”的深拷贝（仅当是 MJCF）
+            if is_mujoco_format:
+                # 用 toString / fromString 做深拷贝，避免后续修改影响原节点
+                try:
+                    XMLParser._last_loaded_mjcf_root = fromstring(tostring(root))
+                except Exception:
+                    XMLParser._last_loaded_mjcf_root = None
+            else:
+                XMLParser._last_loaded_mjcf_root = None
+            is_enhanced_format = root.tag == "Scene"
+            
+            # ⬇⬇ 新增：记录原文件的角度单位，导出时做单位转换用
+            if is_mujoco_format:
+                comp = root.find("compiler")
+                if comp is not None and comp.get("angle"):
+                    XMLParser._last_loaded_angle_mode = comp.get("angle").strip().lower()
+                else:
+                    XMLParser._last_loaded_angle_mode = "radian"
+
+            if is_enhanced_format:
+                return XMLParser._load_enhanced_format(root)
+            elif is_mujoco_format:
+                return XMLParser._load_mujoco_format(root)
+            else:
+                raise ValueError(f"不支持的XML格式：{root.tag}")
+        except Exception as e:
+            print(f"加载XML文件时出错: {e}")
+            return []
+    
+    @staticmethod
+    def _load_enhanced_format(root):
+        """
+        处理增强XML格式（自定义格式）
+        
+        参数:
+            root: XML根元素
+            
+        返回:
+            几何体对象列表
+        """
+        geometries = []
+        objects_node = root.find("Objects")
+        
+        if objects_node is not None:
+            # 递归处理对象树
+            def process_node(node, parent=None):
+                results = []
+                
+                for child in node:
+                    if child.tag == "Group":
+                        # 创建组
+                        name = child.get("name", "Group")
+                        
+                        # 解析位置
+                        pos_elem = child.find("Position")
+                        position = [0, 0, 0]
+                        if pos_elem is not None:
+                            position = [
+                                float(pos_elem.get("x", 0)),
+                                float(pos_elem.get("y", 0)),
+                                float(pos_elem.get("z", 0))
+                            ]
+                        
+                        # 解析旋转
+                        rot_elem = child.find("Rotation")
+                        rotation = [0, 0, 0]
+                        if rot_elem is not None:
+                            rotation = [
+                                float(rot_elem.get("x", 0)),
+                                float(rot_elem.get("y", 0)),
+                                float(rot_elem.get("z", 0))
+                            ]
+                        
+                        # 创建组对象
+                        group = GeometryGroup(name=name, position=position, rotation=rotation, parent=parent)
+                        
+                        # 确保变换矩阵被更新
+                        if hasattr(group, "update_transform_matrix"):
+                            group.update_transform_matrix()
+                        
+                        # 处理子节点
+                        children_elem = child.find("Children")
+                        if children_elem is not None:
+                            child_objects = process_node(children_elem, group)
+                            for child_obj in child_objects:
+                                if parent is None:  # 顶层对象
+                                    group.add_child(child_obj)
+                        
+                        if parent is None:
+                            results.append(group)
+                        else:
+                            parent.add_child(group)
+                        
+                    elif child.tag == "Geometry":
+                        # 处理几何体
+                        name = child.get("name", "Object")
+                        geo_type = child.get("type", "box")
+                        
+                        # 解析位置
+                        pos_elem = child.find("Position")
+                        position = [0, 0, 0]
+                        if pos_elem is not None:
+                            position = [
+                                float(pos_elem.get("x", 0)),
+                                float(pos_elem.get("y", 0)),
+                                float(pos_elem.get("z", 0))
+                            ]
+                            
+                        # 解析尺寸
+                        size_elem = child.find("Size")
+                        size = [1, 1, 1]
+                        if size_elem is not None:
+                            size = [
+                                float(size_elem.get("x", 1)),
+                                float(size_elem.get("y", 1)),
+                                float(size_elem.get("z", 1))
+                            ]
+                            
+                        # 解析旋转
+                        rot_elem = child.find("Rotation")
+                        rotation = [0, 0, 0]
+                        if rot_elem is not None:
+                            rotation = [
+                                float(rot_elem.get("x", 0)),
+                                float(rot_elem.get("y", 0)),
+                                float(rot_elem.get("z", 0))
+                            ]
+                        
+                        # 创建几何体
+                        geo = Geometry(
+                            geo_type=geo_type, 
+                            name=name,
+                            position=position,
+                            size=size,
+                            rotation=rotation,
+                            parent=parent
+                        )
+                        
+                        # 确保变换矩阵被更新
+                        if hasattr(geo, "update_transform_matrix"):
+                            geo.update_transform_matrix()
+                        
+                        # 处理材质
+                        material_elem = child.find("Material")
+                        if material_elem is not None:
+                            color_elem = material_elem.find("Color")
+                            if color_elem is not None:
+                                color = [
+                                    float(color_elem.get("r", 1.0)),
+                                    float(color_elem.get("g", 1.0)),
+                                    float(color_elem.get("b", 1.0)),
+                                    float(color_elem.get("a", 1.0))
+                                ]
+                                geo.material.color = color
+                        
+                        if parent is None:
+                            results.append(geo)
+                        else:
+                            parent.add_child(geo)
+                
+                return results
+            
+            # 开始处理对象节点
+            geometries = process_node(objects_node)
+        
+        return geometries
+    
+    @staticmethod
+    def _load_mujoco_format(root):
+        """
+        处理MuJoCo XML格式
+        
+        参数:
+            root: XML根元素
+            
+        返回:
+            几何体对象列表
+        """
+        #LZQ：0904
+        compiler = root.find("compiler")
+        angle_mode = "degree"
+        if compiler is not None:
+            val = compiler.get("angle")
+            if val:
+                angle_mode = val.strip().lower()
+        is_radian = (angle_mode == "radian")
+        def _to_deg_scalar(x):
+            """单个角度值（可能是弧度）→ 度"""
+            x = float(x)
+            return float(np.degrees(x)) if is_radian else x
+
+        def _to_deg_vec(seq):
+            """角度向量（可能是弧度）→ 度，返回 list[float]"""
+            arr = np.array(list(map(float, seq)), dtype=float)
+            return np.degrees(arr).tolist() if is_radian else arr.tolist()
+        
+        geometries = []
+        
+        # 创建一个字典来跟踪body和对应的几何体组
+        body_groups = {}
+        parent_map = {}  # 用于跟踪父子关系
+        
+        # 构建父子关系映射
+        for body in root.findall(".//body"):
+            body_name = body.get('name', 'Unnamed')
+            # 寻找直接父body
+            parent_body = None
+            for parent in root.findall(".//body"):
+                if body in parent.findall("./body"):
+                    parent_body = parent
+                    break
+            
+            if parent_body is not None:
+                parent_map[body_name] = parent_body.get('name', 'Unnamed')
+        
+        # 处理所有body
+        for body in root.findall(".//body"):
+            body_name = body.get('name', 'Unnamed')
+            if body_name in body_groups:
+                continue  # 跳过已处理的body
+            
+            body_pos = list(map(float, body.get('pos', '0 0 0').split()))
+            # body_euler = list(map(float, body.get('euler', '0 0 0').split())) if 'euler' in body.attrib else [0, 0, 0]
+            
+            #LZQ：0904
+            # 统一把 euler 转成“度”
+            if 'euler' in body.attrib:
+                body_euler = _to_deg_vec(body.get('euler').split())
+            else:
+                body_euler = [0, 0, 0]
+
+            # 检查四元数表示
+            if 'quat' in body.attrib:
+                quat = list(map(float, body.get('quat').split()))
+                if len(quat) == 4:
+                    body_euler = XMLParser._quat_to_euler(quat)
+            
+            # 创建组对象
+            group = GeometryGroup(
+                name=body_name,
+                position=body_pos,
+                rotation=body_euler
+            )
+
+            try:
+                group._mjcf_body_snapshot = ET.fromstring(ET.tostring(body))
+            except Exception:
+                group._mjcf_body_snapshot = None
+
+            
+            # 确保变换矩阵被更新
+            if hasattr(group, "update_transform_matrix"):
+                group.update_transform_matrix()
+            
+            body_groups[body_name] = group
+
+            # === 在这里插入：解析本 body 下的所有 <joint> ===
+            # 小工具：就地解析 vec3 / range（避免额外改动）
+            def _v3(s):
+                if not s: return None
+                p = s.split()
+                return [float(p[0]), float(p[1]), float(p[2])] if len(p) >= 3 else None
+            def _rng(s):
+                if not s: return None
+                p = s.split()
+                return [float(p[0]), float(p[1])] if len(p) >= 2 else None
+
+            #LZQ:0903
+            # 解析 joint 列表并挂到 group.joints
+            # （确保 geometry.py 里 GeometryGroup 有 self.joints = []，见文末）
+            for j in body.findall("joint"):
+                jinfo = {
+                    "name":       j.get("name"),
+                    "type":       j.get("type", "hinge"),
+                    "pos":        _v3(j.get("pos")),
+                    "axis":       _v3(j.get("axis")),
+                    "range":      _rng(j.get("range")),
+                    "limited":    j.get("limited"),
+                    "damping":    j.get("damping"),
+                    "stiffness":  j.get("stiffness"),
+                    "frictionloss": j.get("frictionloss"),
+                    "armature":   j.get("armature"),
+                    "ref":        j.get("ref"),
+                }
+                
+                jt = (jinfo.get("type") or "hinge").lower()
+                
+                #LZQ：0904
+                # range：转动关节是角度 → 统一转“度”；slide 是长度 → 不转换
+                rng = jinfo.get("range")
+                if rng and len(rng) >= 2:
+                    lo, hi = rng[0], rng[1]
+                    if jt != "slide":
+                        lo, hi = _to_deg_scalar(lo), _to_deg_scalar(hi)
+                    jinfo["range"] = [lo, hi]
+
+                # ref：转动关节的参考角（角度）→ 统一转“度”；slide 的参考位移（长度）不要转
+                rv = jinfo.get("ref")
+                if rv is not None:
+                    try:
+                        rvf = float(rv)
+                        if jt != "slide":
+                            rvf = _to_deg_scalar(rvf)
+                        jinfo["ref"] = rvf
+                    except Exception:
+                        pass
+
+                # 若 GeometryGroup 尚无 joints 属性，这里会抛错；见下文 A 必改
+                group.joints.append(jinfo)
+            # === 插入结束 ===
+            
+            # 添加所有geom子对象
+            for geom in body.findall("geom"):
+                geo_type = geom.get('type', 'box')
+                geom_name = geom.get('name', f"{body_name}_geom")
+                
+                # 解析尺寸
+                size_str = geom.get('size', '1 1 1')
+                size = list(map(float, size_str.split()))
+                
+                # 适当地处理尺寸格式
+                if geo_type == 'sphere':
+                    if len(size) == 1:
+                        size = [size[0], size[0], size[0]]  # 保持三个相同的半径值
+                elif geo_type == 'ellipsoid':
+                    # 确保有三个尺寸
+                    if len(size) < 3:
+                        size.extend([size[0]] * (3 - len(size)))
+                elif geo_type in ['capsule', 'cylinder']:
+                    # 确保有两个尺寸
+                    if len(size) < 2:
+                        size.append(1.0)  # 默认半高
+                    if len(size) < 3:
+                        size.append(0)  # 补充第三个参数
+                
+                # 解析位置（相对于body的局部坐标）
+                local_pos = list(map(float, geom.get('pos', '0 0 0').split())) if 'pos' in geom.attrib else [0, 0, 0]
+                
+                # 解析旋转
+                local_euler = [0, 0, 0]
+                if 'euler' in geom.attrib:
+                    local_euler = _to_deg_vec(geom.get('euler').split())
+                elif 'quat' in geom.attrib:
+                    quat = list(map(float, geom.get('quat').split()))
+                    if len(quat) == 4:
+                        local_euler = XMLParser._quat_to_euler(quat)
+                
+                # 解析颜色
+                color = [0.8, 0.8, 0.8, 1.0]  # 默认灰色
+                
+                # 优先使用rgba属性
+                if 'rgba' in geom.attrib:
+                    rgba_str = geom.get('rgba')
+                    rgba_values = list(map(float, rgba_str.split()))
+                    # 确保有四个值
+                    if len(rgba_values) == 3:
+                        rgba_values.append(1.0)  # 添加alpha默认值
+                    elif len(rgba_values) < 3:
+                        rgba_values = [0.8, 0.8, 0.8, 1.0]  # 默认灰色
+                    color = rgba_values
+                # 检查是否引用了material
+                elif 'material' in geom.attrib:
+                    material_name = geom.get('material')
+                    # 尝试在asset下找到对应的material
+                    material_elem = root.find(f".//asset/material[@name='{material_name}']")
+                    if material_elem is not None and 'rgba' in material_elem.attrib:
+                        rgba_str = material_elem.get('rgba')
+                        color = list(map(float, rgba_str.split()))
+                        if len(color) == 3:
+                            color.append(1.0)  # 添加默认透明度
+                
+                # 创建几何体
+                geo = Geometry(
+                    geo_type=geo_type,
+                    name=geom_name,
+                    position=local_pos,
+                    size=size,
+                    rotation=local_euler,
+                    parent=group
+                )
+                
+                # 保存原始 MJCF 属性（用于导出直通）
+                geo.mjcf_attrs = dict(geom.attrib)
+                geo._mjcf_had_name = ('name' in geom.attrib)
+
+                # 设置颜色
+                geo.material.color = color
+                
+                # 确保变换矩阵被更新
+                if hasattr(geo, "update_transform_matrix"):
+                    geo.update_transform_matrix()
+                
+                # 添加到组中
+                group.add_child(geo)
+        
+        # 在返回前进行一次全面的变换矩阵更新
+        # 先确保所有父子关系已经建立
+        for body_name, parent_name in parent_map.items():
+            if body_name in body_groups and parent_name in body_groups:
+                child_group = body_groups[body_name]
+                parent_group = body_groups[parent_name]
+                
+                # 避免重复添加
+                if child_group not in parent_group.children:
+                    parent_group.add_child(child_group)
+        
+        # 收集所有顶层组（没有父组的组）
+        top_level_groups = []
+        for name, group in body_groups.items():
+            if name not in parent_map:  # 没有父组
+                top_level_groups.append(group)
+        
+        # 如果找到了顶层组，将它们添加到geometries
+        if top_level_groups:
+            geometries.extend(top_level_groups)
+        
+        # 处理worldbody下的直接geom
+        # 处理worldbody下的直接geom —— 直接作为顶层对象，不再包装到 "World" 组
+        world_body = root.find(".//worldbody")
+        if world_body is not None:
+            for geom in world_body.findall("geom"):
+                # 可按需排除参考平面与坐标轴（保留你原来的过滤）
+                geom_name = geom.get('name', '')
+                if geom_name in ["ground", "x_axis", "y_axis", "z_axis"]:
+                    continue
+
+                geo_type = geom.get('type', 'box')
+
+                # pos / size
+                pos = list(map(float, geom.get('pos', '0 0 0').split()))
+                size_str = geom.get('size', '1 1 1')
+                size = list(map(float, size_str.split()))
+
+                # 尺寸格式修正（与你现有逻辑一致）
+                if geo_type == 'sphere':
+                    if len(size) == 1:
+                        size = [size[0], size[0], size[0]]
+                elif geo_type in ['capsule', 'cylinder']:
+                    if len(size) < 2:
+                        size.append(1.0)  # 半高默认
+                    if len(size) < 3:
+                        size.append(0)
+                elif len(size) < 3:
+                    size.extend([1.0] * (3 - len(size)))
+
+                # 旋转（统一转成“度”存内存）
+                euler = [0, 0, 0]
+                if 'euler' in geom.attrib:
+                    euler = _to_deg_vec(geom.get('euler').split())
+                elif 'quat' in geom.attrib:
+                    quat = list(map(float, geom.get('quat').split()))
+                    if len(quat) == 4:
+                        euler = XMLParser._quat_to_euler(quat)
+
+                # 颜色
+                color = [0.8, 0.8, 0.8, 1.0]
+                if 'rgba' in geom.attrib:
+                    rgba_values = list(map(float, geom.get('rgba').split()))
+                    if len(rgba_values) >= 3:
+                        color = rgba_values
+                        if len(color) == 3:
+                            color.append(1.0)
+
+                # 创建“顶层”几何：parent=None（不要包到 World 组）
+                geo = Geometry(
+                    geo_type=geo_type,
+                    name=geom_name or "Object",
+                    position=pos,
+                    size=size,
+                    rotation=euler,
+                    parent=None
+                )
+
+                # 保留原始 MJCF 属性（导出直通）
+                geo.mjcf_attrs = dict(geom.attrib)
+                geo._mjcf_had_name = ('name' in geom.attrib)
+
+                # 设置颜色
+                geo.material.color = color
+
+                # 更新矩阵
+                if hasattr(geo, "update_transform_matrix"):
+                    geo.update_transform_matrix()
+
+                # 直接作为“顶层对象”加入场景
+                geometries.append(geo)
+
+        
+        # 最后，对所有对象进行两遍更新以确保变换正确传播
+        # 第一遍：更新所有对象的本地变换
+        XMLParser._update_transforms_recursive(geometries)
+        
+        # 第二遍：确保世界变换正确传播
+        XMLParser._update_world_transforms_recursive(geometries)
+        
+        return geometries
+    
+    @staticmethod
+    def _update_transforms_recursive(objects):
+        """递归更新所有几何体的变换矩阵"""
+        if isinstance(objects, list):
+            for obj in objects:
+                XMLParser._update_transforms_recursive(obj)
+        else:
+            # 更新当前对象的变换矩阵
+            if hasattr(objects, "update_transform_matrix"):
+                objects.update_transform_matrix()
+            
+            # 如果是组，递归更新子对象
+            if hasattr(objects, "children") and objects.children:
+                for child in objects.children:
+                    XMLParser._update_transforms_recursive(child)
+    
+    @staticmethod
+    def _update_world_transforms_recursive(objects):
+        """递归更新所有几何体的世界变换矩阵"""
+        if isinstance(objects, list):
+            for obj in objects:
+                XMLParser._update_world_transforms_recursive(obj)
+        else:
+            # 更新当前对象的全局变换
+            if hasattr(objects, "update_global_transform"):
+                objects.update_global_transform()
+            elif hasattr(objects, "update_transform_matrix"):
+                # 如果没有专门的全局变换更新方法，使用常规更新
+                objects.update_transform_matrix()
+            
+            # 如果是组，递归更新子对象
+            if hasattr(objects, "children") and objects.children:
+                for child in objects.children:
+                    XMLParser._update_world_transforms_recursive(child)
+    
+    @staticmethod
+    def export_mujoco_xml(filename, geometries):
+        try:
+            use_cached = isinstance(getattr(XMLParser, "_last_loaded_mjcf_root", None), ET.Element)
+
+            if use_cached:
+                # 1) 以原始根为底稿
+                root = fromstring(ET.tostring(XMLParser._last_loaded_mjcf_root))
+
+                # 2) 一律导出为弧度
+                # 不重复添加 <compiler angle="radian"/>：只要已经存在，就不再新增
+                has_radian = any(((c.get("angle") or "").strip().lower() == "radian")
+                                for c in root.findall("compiler"))
+                if not has_radian:
+                    comp = ET.SubElement(root, "compiler")  # 放在文档末尾
+                    comp.set("angle", "radian")
+
+                # 3) worldbody：只替换 body/geom，其它孩子（camera/light/...）保留
+                worldbody = root.find("worldbody") or ET.SubElement(root, "worldbody")
+
+                # 收集“非 body/geom”的孩子（camera/light/...）
+                keep_nodes = [ch for ch in list(worldbody) if ch.tag not in ("body", "geom")]
+
+                # 清空 worldbody 的所有子节点
+                for ch in list(worldbody):
+                    worldbody.remove(ch)
+
+                # 先把保留节点按原顺序放回去（这样 camera 仍在最前）
+                for node in keep_nodes:
+                    worldbody.append(node)
+
+                # 再重建当前场景的 body/geom
+                for obj in geometries:
+                    XMLParser._add_object_to_mujoco(worldbody, obj)
+
+                # 4) 若原文件 angle=degree，则把所有 joint 的角度字段（range/ref）按“度→弧度”批量转换
+                if getattr(XMLParser, "_last_loaded_angle_mode", "radian") == "degree":
+                    XMLParser._convert_joint_angles_to_radian(root)
+
+            else:
+                # 原逻辑（新建场景）
+                root = ET.Element("mujoco")
+                root.set("model", "MJCFScene")
+                compiler = ET.SubElement(root, "compiler")
+                compiler.set("angle", "radian")
+                asset = ET.SubElement(root, "asset")
+                worldbody = ET.SubElement(root, "worldbody")
+                for obj in geometries:
+                    XMLParser._add_object_to_mujoco(worldbody, obj)
+
+
+            # ——统一的写文件部分（不管哪个分支都走这里）——
+            rough = ET.tostring(root, "utf-8")
+            pretty = minidom.parseString(rough).toprettyxml(indent="  ", newl="\n")
+            # 去掉空白行
+            pretty = "\n".join(line for line in pretty.splitlines() if line.strip())
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(pretty + "\n")
+            return True
+
+
+        except Exception as e:
+            print(f"导出MuJoCo XML时出错: {e}")
+            return False
+
+    
+    @staticmethod
+    def _add_object_to_mujoco(parent_elem, obj, prefix=""):
+        if obj.type == "group":
+            # 有原始 <body> 快照 → 用它为底稿，只清掉里面的 <geom>，其余都保留
+            if hasattr(obj, "_mjcf_body_snapshot") and isinstance(obj._mjcf_body_snapshot, ET.Element):
+                body_elem = ET.fromstring(ET.tostring(obj._mjcf_body_snapshot))
+                parent_elem.append(body_elem)
+
+                # 更新 name/pos/euler（以当前编辑器为准；euler 导出用弧度）
+                body_elem.set("name", obj.name)
+                body_elem.set("pos", f"{obj.position[0]} {obj.position[1]} {obj.position[2]}")
+                if any(obj.rotation):
+                    r = np.radians(obj.rotation)
+                    body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+                # ⚠️ 重要：如果当前为 0，就不要动快照里的 euler；不要 pop 掉
+                # else:
+                #     body_elem.attrib.pop("euler", None)   # ← 删除这一行（见问题 2）
+
+                # 清掉旧 geom，准备写入当前几何体
+                for g in list(body_elem.findall("geom")):
+                    body_elem.remove(g) 
+
+                # ⬇️ 新增：也清旧的子 body，避免重复
+                for b in list(body_elem.findall("body")):
+                    body_elem.remove(b)
+
+                # 递归写入子对象
+                for child in obj.children:
+                    XMLParser._add_object_to_mujoco(body_elem, child, prefix=prefix)
+
+            else:
+                # 没快照（新建场景）→ 走旧逻辑：新建 body，并递归写入
+                body_elem = ET.SubElement(parent_elem, "body")
+                body_elem.set("name", obj.name)
+                body_elem.set("pos", f"{obj.position[0]} {obj.position[1]} {obj.position[2]}")
+                if any(obj.rotation):
+                    r = np.radians(obj.rotation)
+                    body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+
+                # 如你不需要重建 joint，这里就不要写 joint
+                for child in obj.children:
+                    XMLParser._add_object_to_mujoco(body_elem, child, prefix=prefix)
+
+        else:
+            # 处理几何体 -> geom
+            geom_elem = ET.SubElement(parent_elem, "geom")
+
+            # 是否具备“从 MJCF 读取时带来的原始属性快照”
+            has_orig = hasattr(obj, "mjcf_attrs") and isinstance(getattr(obj, "mjcf_attrs", None), dict)
+
+            # 1) 先把原始属性全部写回（mesh/condim/solimp/solref/friction 等都会保留）
+            if has_orig:
+                for k, v in obj.mjcf_attrs.items():
+                    try:
+                        geom_elem.set(k, v)
+                    except Exception:
+                        pass
+
+            # 2) 类型：以当前编辑器中的类型为准（可能你在 UI 改了类型）
+            geom_elem.set("type", obj.type)
+
+            # 3) 位置：总是用当前值覆盖
+            geom_elem.set("pos", f"{obj.position[0]} {obj.position[1]} {obj.position[2]}")
+
+            # 4) 旋转：内部用“度”，导出写“弧度”
+            if any(obj.rotation):
+                r = np.radians(obj.rotation)
+                geom_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+            # 若当前旋转全 0：如果原始 attrs 里有 euler 就保持；否则不写（由 MuJoCo 默认）
+
+            # 5) 尺寸：
+            #    - primitive 一律写 size（按 MuJoCo 规则）
+            #    - mesh：仅当“原始就带 size”或该对象是新建对象（无 mjcf_attrs）时才写 size
+            if obj.type == "mesh":
+                if not has_orig:
+                    # 编辑器里新建的 mesh：保持你原本的写法
+                    geom_elem.set("size", f"{obj.size[0]} {obj.size[1]} {obj.size[2]}")
+                else:
+                    if "size" in obj.mjcf_attrs:
+                        # 原始就有 size：按当前值更新
+                        geom_elem.set("size", f"{obj.size[0]} {obj.size[1]} {obj.size[2]}")
+                    else:
+                        # 原始没有 size：不要凭空写入
+                        geom_elem.attrib.pop("size", None)
+            elif obj.type == GeometryType.SPHERE.value:
+                geom_elem.set("size", f"{obj.size[0]}")
+            elif obj.type in [GeometryType.CYLINDER.value, GeometryType.CAPSULE.value]:
+                geom_elem.set("size", f"{obj.size[0]} {obj.size[2]}")
+            elif obj.type == "plane":
+                geom_elem.set("size", "0 0 0.01")
+            else:
+                geom_elem.set("size", f"{obj.size[0]} {obj.size[1]} {obj.size[2]}")
+
+            # 6) 颜色：总是用当前值覆盖
+            geom_elem.set("rgba", f"{obj.material.color[0]} {obj.material.color[1]} {obj.material.color[2]} {obj.material.color[3]}")
+
+            # 7) name：
+            #    - 若是从文件来的对象：只有“原文件里本来就有 name”才写 name
+            #    - 若是编辑器新建对象：照旧写 name
+            if has_orig:
+                had_name = getattr(obj, "_mjcf_had_name", False)
+                if had_name:
+                    geom_elem.set("name", obj.name)
+                else:
+                    geom_elem.attrib.pop("name", None)
+            else:
+                geom_elem.set("name", obj.name)
+
+    @staticmethod
+    def _quat_to_euler(quat):
+        """四元数转欧拉角（ZYX顺序）"""
+        # 实现四元数到欧拉角的转换
+        # 这里使用简化的计算方法
+        w, x, y, z = quat
+        
+        # 计算姿态角
+        t0 = 2.0 * (w * x + y * z)
+        t1 = 1.0 - 2.0 * (x * x + y * y)
+        roll = np.degrees(np.arctan2(t0, t1))
+        
+        t2 = 2.0 * (w * y - z * x)
+        t2 = np.clip(t2, -1.0, 1.0)
+        pitch = np.degrees(np.arcsin(t2))
+        
+        t3 = 2.0 * (w * z + x * y)
+        t4 = 1.0 - 2.0 * (y * y + z * z)
+        yaw = np.degrees(np.arctan2(t3, t4))
+        
+        return [roll, pitch, yaw]
+    
+    
+    # 保存方法别名，使用增强XML格式
+    save = export_mujoco_xml
+
+    @staticmethod
+    def _convert_joint_angles_to_radian(root):
+        """把所有 joint 的角度字段（range/ref）从“度”转成“弧度”。slide 关节不转换。"""
+        for je in root.findall(".//joint"):
+            jt = (je.get("type") or "hinge").lower()
+
+            # range: 两个数
+            rng = je.get("range")
+            if rng:
+                parts = rng.split()
+                if len(parts) >= 2:
+                    try:
+                        lo, hi = float(parts[0]), float(parts[1])
+                        if jt != "slide":      # slide 的 range 是长度，不能转角度
+                            lo, hi = np.radians([lo, hi])
+                        je.set("range", f"{lo:g} {hi:g}")
+                    except Exception:
+                        pass
+
+            # ref: 一个数
+            rv = je.get("ref")
+            if rv:
+                try:
+                    ref = float(rv)
+                    if jt != "slide":
+                        ref = float(np.radians(ref))
+                    je.set("ref", f"{ref:g}")
+                except Exception:
+                    pass
+
