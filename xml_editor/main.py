@@ -116,13 +116,13 @@ class MainWindow(QMainWindow):
 
         # 打开
         open_action_ply = QAction("打开(&ply)...", self)
-        open_action_ply.setShortcut(QKeySequence.Open)
+        # open_action_ply.setShortcut(QKeySequence.Open)
         open_action_ply.triggered.connect(self._open_file_ply)
         file_menu.addAction(open_action_ply)
 
         # 1) 菜单里添加一个“打开 OBJ/STL”
         open_mesh_action = QAction("打开(&OBJ/STL)...", self)
-        open_mesh_action.setShortcut("Ctrl+Shift+O")
+        # open_mesh_action.setShortcut("Ctrl+Shift+O")
         open_mesh_action.triggered.connect(self._open_file_mesh)
         file_menu.addAction(open_mesh_action)
        
