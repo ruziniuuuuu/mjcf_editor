@@ -55,7 +55,7 @@ class XMLParser:
                 if comp is not None and comp.get("angle"):
                     XMLParser._last_loaded_angle_mode = comp.get("angle").strip().lower()
                 else:
-                    XMLParser._last_loaded_angle_mode = "degree"
+                    XMLParser._last_loaded_angle_mode = "radian"
 
             if is_enhanced_format:
                 return XMLParser._load_enhanced_format(root)
@@ -218,7 +218,7 @@ class XMLParser:
         """
         #LZQ：0904
         compiler = root.find("compiler")
-        angle_mode = "degree"
+        angle_mode = "radian"
         if compiler is not None:
             val = compiler.get("angle")
             if val:
