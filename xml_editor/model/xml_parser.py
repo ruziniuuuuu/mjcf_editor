@@ -647,9 +647,13 @@ class XMLParser:
                 # 更新 name/pos/euler（以当前编辑器为准；euler 导出用弧度）
                 body_elem.set("name", obj.name)
                 body_elem.set("pos", f"{obj.position[0]} {obj.position[1]} {obj.position[2]}")
-                if any(obj.rotation):
-                    r = np.radians(obj.rotation)
-                    body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+                # if any(obj.rotation):
+                #     r = np.radians(obj.rotation)
+                #     body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+                rot = np.asarray(obj.rotation, dtype=float)
+                r = np.radians(rot)  # 0 0 0 也会得到 0 0 0
+                body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+
                 # ⚠️ 重要：如果当前为 0，就不要动快照里的 euler；不要 pop 掉
                 # else:
                 #     body_elem.attrib.pop("euler", None)   # ← 删除这一行（见问题 2）
@@ -671,9 +675,13 @@ class XMLParser:
                 body_elem = ET.SubElement(parent_elem, "body")
                 body_elem.set("name", obj.name)
                 body_elem.set("pos", f"{obj.position[0]} {obj.position[1]} {obj.position[2]}")
-                if any(obj.rotation):
-                    r = np.radians(obj.rotation)
-                    body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+                # if any(obj.rotation):
+                #     r = np.radians(obj.rotation)
+                #     body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+                rot = np.asarray(obj.rotation, dtype=float)
+                r = np.radians(rot)  # 0 0 0 也会得到 0 0 0
+                body_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+
 
                 # 如你不需要重建 joint，这里就不要写 joint
                 for child in obj.children:
@@ -701,9 +709,12 @@ class XMLParser:
             geom_elem.set("pos", f"{obj.position[0]} {obj.position[1]} {obj.position[2]}")
 
             # 4) 旋转：内部用“度”，导出写“弧度”
-            if any(obj.rotation):
-                r = np.radians(obj.rotation)
-                geom_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+            # if any(obj.rotation):
+            #     r = np.radians(obj.rotation)
+            #     geom_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
+            rot = np.asarray(obj.rotation, dtype=float)
+            r = np.radians(rot)  # 0 0 0 也会得到 0 0 0
+            geom_elem.set("euler", f"{r[0]} {r[1]} {r[2]}")
             # 若当前旋转全 0：如果原始 attrs 里有 euler 就保持；否则不写（由 MuJoCo 默认）
 
             # 5) 尺寸：
