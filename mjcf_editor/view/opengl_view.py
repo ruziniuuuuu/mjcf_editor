@@ -13,6 +13,7 @@ from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *  # 添加GLUT库导入
 import os, subprocess
+import importlib
 import math
 import shutil
 import datetime
@@ -33,14 +34,18 @@ except Exception as e:
     print(f"警告: 无法初始化GLUT: {e}")
     raise e
 
-# yc
-# 添加 DISCOVERSE 项目的根目录到 sys.path
-sys.path.append(os.path.abspath('/root/DISCOVERSE'))
 # 导入 GSRenderer
-from discoverse.gaussian_renderer.gsRenderer import GSRenderer
-# import cv2 as cv
-# import os
-GSP_EDIT = Path("../../scripts/gsply_edit.py")
+try:
+    from discoverse.gaussian_renderer.gsRenderer import GSRenderer # type: ignore
+    discoverse_pkg = importlib.import_module("discoverse")
+    GSP_EDIT = Path(discoverse_pkg.__file__).resolve().parent / "scripts" / "gsply_edit.py"
+    if not GSP_EDIT.exists():
+        print(f"警告: 未在 discoverse 库中找到 gsply_edit.py: {GSP_EDIT}")
+        GSP_EDIT = None
+except Exception as e:
+    GSRenderer = None
+    GSP_EDIT = None
+    print(f"警告: 无法导入 discoverse 库: {e}")
 class OpenGLView(QOpenGLWidget):
     """
     OpenGL视图类
@@ -252,6 +257,12 @@ class OpenGLView(QOpenGLWidget):
         self.model_dict = model_dict
         self._gs_source_files = source_map
         self._gs_keys = gs_keys
+
+        if GSRenderer is None:
+            print("[GS-Edit] discoverse 库不可用，无法创建 GSRenderer。")
+            self.gs_renderer = None
+            self.gs_enable = False
+            return
 
         try:
             # 构造高斯渲染器并立即绑定当前窗口尺寸
@@ -3054,6 +3065,10 @@ class OpenGLView(QOpenGLWidget):
         if abs(qx)+abs(qy)+abs(qz)+abs(qw) < 1e-12:
             qx,qy,qz,qw = 0.0,0.0,0.0,1.0
         scale = float(scale) if scale is not None else 1.0
+
+        if GSP_EDIT is None or not os.path.exists(GSP_EDIT):
+            print("[GS-Edit] 未找到 gsply_edit.py，无法执行点云变换。")
+            return
 
         cmd = [
             "python", str(GSP_EDIT), str(in_path),
