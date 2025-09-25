@@ -26,5 +26,8 @@ gsrenderer = [
     "discoverse @ git+https://github.com/TATP-233/DISCOVERSE.git",
 ]
 
+[project.scripts]
+mjcf_editor = "mjcf_editor.main:main"
+
 [tool.setuptools]
 packages = ["mjcf_editor"]
