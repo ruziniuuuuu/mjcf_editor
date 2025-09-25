@@ -66,7 +66,7 @@ class HierarchyViewModel(QObject):
     def select_geometry(self, geometry):
         """
         选择单个几何体（向后兼容）
-        
+
         参数:
             geometry: 要选择的几何体
         """
@@ -88,7 +88,6 @@ class HierarchyViewModel(QObject):
             self._scene_viewmodel.selected_geometry = self._selected_geometries[-1]
         else:
             self._scene_viewmodel.selected_geometry = None
-            
         self.selectionChanged.emit(self._selected_geometries)
     
     def toggle_geometry_selection(self, geometry):
@@ -108,7 +107,6 @@ class HierarchyViewModel(QObject):
             self._scene_viewmodel.selected_geometry = self._selected_geometries[-1]
         else:
             self._scene_viewmodel.selected_geometry = None
-            
         self.selectionChanged.emit(self._selected_geometries)
     
     def clear_selection(self):
@@ -187,7 +185,8 @@ class HierarchyViewModel(QObject):
                     name=self._generate_copy_name(item.name, used_names),
                     position=item.position,
                     rotation=item.rotation,
-                    parent=parent
+                    parent=parent,
+                    source_file=getattr(item, 'source_file', None)
                 )
             else:
                 # 复制几何体
@@ -199,7 +198,9 @@ class HierarchyViewModel(QObject):
                     'capsule': GeometryType.CAPSULE,
                     'plane': GeometryType.PLANE,
                     'ellipsoid': GeometryType.ELLIPSOID,
-                    'triangle': GeometryType.TRIANGLE
+                    'triangle': GeometryType.TRIANGLE,
+                    'mesh': GeometryType.MESH,
+                    'joint': GeometryType.JOINT,
                 }
                 geo_type = geo_type_map.get(item.type)
                 
@@ -213,7 +214,8 @@ class HierarchyViewModel(QObject):
                     position=item.position,
                     size=item.size,
                     rotation=item.rotation,
-                    parent=parent
+                    parent=parent,
+                    source_file=getattr(item, 'source_file', None)
                 )
                 
                 # 复制材质
@@ -257,7 +259,9 @@ class HierarchyViewModel(QObject):
             'capsule': GeometryType.CAPSULE,
             'plane': GeometryType.PLANE,
             'ellipsoid': GeometryType.ELLIPSOID,
-            'triangle': GeometryType.TRIANGLE
+            'triangle': GeometryType.TRIANGLE,
+            'mesh': GeometryType.MESH,
+            'joint': GeometryType.JOINT,
         }
         
         for child in source.children:
@@ -267,7 +271,8 @@ class HierarchyViewModel(QObject):
                     name=self._generate_copy_name(child.name, used_names),
                     position=child.position,
                     rotation=child.rotation,
-                    parent=target
+                    parent=target,
+                    source_file=getattr(child, 'source_file', None)
                 )
             else:
                 # 获取枚举类型
@@ -284,7 +289,8 @@ class HierarchyViewModel(QObject):
                     position=child.position,
                     size=child.size,
                     rotation=child.rotation,
-                    parent=target
+                    parent=target,
+                    source_file=getattr(child, 'source_file', None)
                 )
                 
                 # 复制材质

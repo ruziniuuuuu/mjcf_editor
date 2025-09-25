@@ -35,6 +35,10 @@ class ControlViewModel(QObject):
         """
         super().__init__()
         self._scene_viewmodel = scene_viewmodel
+        try:
+            self._scene_viewmodel.control_viewmodel = self
+        except Exception:
+            pass
         
         # 连接场景视图模型的信号
         self._scene_viewmodel.operationModeChanged.connect(self.operationModeChanged)
@@ -90,6 +94,10 @@ class ControlViewModel(QObject):
         
         # 记录初始状态
         self._record_operation_state()
+
+    def record_current_state(self):
+        """外部调用：立即记录一次当前状态"""
+        return self._record_operation_state()
 
     @property
     def operation_mode(self):
@@ -374,6 +382,7 @@ class ControlViewModel(QObject):
             self.redoStateChanged.emit(False)  # 新操作后不可重做
             
             print(f"操作状态已记录，当前历史记录数: {len(self._history_files)}, 索引: {self._current_history_index}")  # 调试输出
+            self._last_save_time = datetime.datetime.now()
             return file_path
         except Exception as e:
             print(f"记录操作状态失败: {str(e)}")

@@ -7,11 +7,13 @@
 from PyQt5.QtCore import QObject, pyqtSignal
 import numpy as np
 import os
+import shutil
 
 from ..model.geometry import (
     Geometry, GeometryGroup, GeometryType, 
     Material, OperationMode
 )
+from ..utils.mesh_loader import load_mesh as load_mesh_file
 from ..model.xml_parser import XMLParser
 from ..model.raycaster import GeometryRaycaster, RaycastResult
 
@@ -33,9 +35,10 @@ class SceneViewModel(QObject):
     positionChanged = pyqtSignal(object)  # 位置变化信号
     rotationChanged = pyqtSignal(object)  # 旋转变化信号
     scaleChanged = pyqtSignal(object)     # 缩放变化信号
-    
+
     #LZQ：0904
     gizmoSizeChanged = pyqtSignal(float)   # 全局 gizmo 大小变化
+    gsBackgroundsChanged = pyqtSignal(list, object)  # 高斯背景变化 (entries, active_key)
     
     def __init__(self):
         super().__init__()
@@ -55,6 +58,21 @@ class SceneViewModel(QObject):
 
         #LZQ：0904
         self.global_gizmo_size_world = 1.0
+        self._gs_backgrounds = []
+        self._gs_active_background = None
+        self._gs_edit_history = []
+        self.control_viewmodel = None
+
+        self._default_physics_attrs = {
+            "density": "1000",
+            "friction": "1 0.5 0.5",
+            "solref": "0.02 1",
+            "solimp": "0.9 0.95 0.001",
+            "margin": "0.0",
+        }
+
+        self._source_groups = {}
+        self._active_source_file = None
     
     @property
     def geometries(self):
@@ -65,6 +83,11 @@ class SceneViewModel(QObject):
     def geometries(self, value):
         """设置几何体列表并发出通知"""
         self._geometries = value
+        self._source_groups = {}
+        for obj in self._geometries:
+            source = getattr(obj, 'source_file', None)
+            if getattr(obj, '_is_source_root', False) and source:
+                self._source_groups[os.path.abspath(source)] = obj
         self._update_raycaster()
         self.geometriesChanged.emit()
     
@@ -79,13 +102,29 @@ class SceneViewModel(QObject):
         # 先取消之前选中的几何体
         if self._selected_geo:
             self._selected_geo.selected = False
-        
+
         self._selected_geo = value
-        
+
         # 标记新选中的几何体
         if self._selected_geo:
             self._selected_geo.selected = True
-        
+            # 选中时先切到平移模式，方便立即操作，同时刷新 Gizmo 尺度
+            if self._operation_mode == OperationMode.OBSERVE:
+                self.operation_mode = OperationMode.TRANSLATE
+            self._auto_update_gizmo_size(self._selected_geo)
+
+        source_candidate = None
+        if self._selected_geo:
+            source_candidate = getattr(self._selected_geo, 'source_file', None)
+            if source_candidate is None and getattr(self._selected_geo, 'parent', None) is not None:
+                source_candidate = getattr(self._selected_geo.parent, 'source_file', None)
+        self._active_source_file = source_candidate
+
+        if self._active_source_file:
+            XMLParser.activate_context(self._active_source_file)
+        else:
+            XMLParser.activate_context(None)
+
         # 发出选择变化信号 - 但不触发几何体变化信号
         self.selectionChanged.emit(self._selected_geo)
     
@@ -140,7 +179,7 @@ class SceneViewModel(QObject):
         else:
             self._raycaster = GeometryRaycaster(self._camera_config, self._geometries)
     
-    def create_geometry(self, geo_type, name=None, position=(0, 0, 0), size=(1, 1, 1), rotation=(0, 0, 0), parent=None):
+    def create_geometry(self, geo_type, name=None, position=(0, 0, 0), size=(1, 1, 1), rotation=(0, 0, 0), parent=None, source_file=None):
         """
         创建新的几何体
         
@@ -156,10 +195,12 @@ class SceneViewModel(QObject):
             创建的几何体对象
         """
         # 自动生成名称
+        existing_names = {geo.name for geo in self.get_all_geometries()}
         if name is None:
-            counter = sum(1 for g in self.get_all_geometries() if g.type == geo_type.value)
-            type_name = geo_type.name.capitalize()
-            name = f"{type_name}{counter + 1}"
+            base_name = geo_type.name.capitalize()
+            name = self._generate_unique_name(base_name)
+        elif name in existing_names:
+            name = self._generate_unique_name(name)
         
         # 创建几何体
         geometry = Geometry(
@@ -170,19 +211,247 @@ class SceneViewModel(QObject):
             rotation=rotation,
             parent=parent
         )
+
+        # 标记为编辑器新建对象，导出时保留 name 属性
+        geometry._mjcf_had_name = True
+        if geo_type == GeometryType.JOINT:
+            geometry.joint_angle_mode = 'radian'
+
+        if source_file is None:
+            if parent is not None:
+                source_file = getattr(parent, 'source_file', None)
+            if source_file is None:
+                source_file = self._active_source_file
+
+        geometry.source_file = source_file
+
+        self._apply_default_physics_attrs(geometry)
         
         # 添加到场景中
         if parent:
             parent.add_child(geometry)
         else:
-            self._geometries.append(geometry)
-        
+            target_group = None
+            if source_file and source_file in self._source_groups:
+                target_group = self._source_groups[source_file]
+            if target_group:
+                target_group.add_child(geometry)
+            else:
+                self._geometries.append(geometry)
+
         # 触发更新
+        self._update_raycaster()
         self.geometriesChanged.emit()
-        
+
         return geometry
-    
-    def create_group(self, name=None, position=(0, 0, 0), rotation=(0, 0, 0), parent=None):
+
+    def _generate_unique_name(self, base_name: str) -> str:
+        """生成在当前场景中唯一的名称"""
+        existing = {geo.name for geo in self.get_all_geometries()}
+        if base_name not in existing:
+            return base_name
+
+        index = 1
+        while f"{base_name}_{index}" in existing:
+            index += 1
+        return f"{base_name}_{index}"
+
+    def create_mesh_from_path(self, path: str, name=None, parent=None):
+        """
+        从外部 OBJ/STL 文件构建 mesh 几何体：
+        - 读取三角面与法线
+        - 计算包围盒，设置初始位置/尺寸
+        - 注册 mesh 资产，方便保存与后续缩放
+        """
+        try:
+            triangles, normals = load_mesh_file(path)
+        except Exception as exc:
+            print(f"[Mesh] 加载失败: {path} -> {exc}")
+            return None
+
+        if triangles is None or len(triangles) == 0:
+            print(f"[Mesh] 文件无有效三角形: {path}")
+            return None
+
+        tris_np = np.asarray(triangles, dtype=np.float32)
+        norms_np = None if normals is None else np.asarray(normals, dtype=np.float32)
+
+        # 基于三角面顶点计算包围盒，确定初始中心和尺寸
+        pts = tris_np.reshape(-1, 3)
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        center = (mins + maxs) * 0.5
+        half_extents = np.maximum((maxs - mins) * 0.5, 1e-5)
+
+        # 将局部几何体平移到以原点为中心，便于后续变换
+        tris_local = (tris_np - center.reshape(1, 1, 3)).astype(np.float32)
+
+        base = name or os.path.splitext(os.path.basename(path))[0] or "mesh"
+        unique_name = self._generate_unique_name(base)
+
+        geometry = Geometry(
+            geo_type=GeometryType.MESH.value,
+            name=unique_name,
+            position=tuple(center.tolist()),
+            size=tuple(half_extents.tolist()),
+            rotation=(0.0, 0.0, 0.0),
+            parent=parent
+        )
+
+        geometry.material.color = np.array([0.8, 0.8, 0.8, 1.0], dtype=np.float32)
+        geometry.mesh_model_triangles = tris_local
+        geometry.mesh_model_normals = None if norms_np is None else norms_np.astype(np.float32)
+        geometry.mesh_path = path
+        geometry.mesh_asset_scale = [1.0, 1.0, 1.0]
+        geometry.mesh_geom_scale = [1.0, 1.0, 1.0]
+        geometry.mesh_name = unique_name
+        geometry.mjcf_attrs = {"mesh": unique_name}
+        geometry.mesh_origin_offset = center.astype(np.float32).tolist()
+        geometry._mjcf_had_name = True
+
+        geometry.source_file = self._active_source_file
+        self._apply_default_physics_attrs(geometry)
+
+        # 向 XMLParser 注册 mesh 资产，保存/导出时可以引用同一资源
+        XMLParser.register_mesh_asset(unique_name, path, [1.0, 1.0, 1.0], has_scale_attr=False)
+
+        if parent:
+            parent.add_child(geometry)
+        else:
+            target_group = None
+            if geometry.source_file and geometry.source_file in self._source_groups:
+                target_group = self._source_groups[geometry.source_file]
+            if target_group:
+                target_group.add_child(geometry)
+            else:
+                self._geometries.append(geometry)
+
+        if hasattr(geometry, "update_transform_matrix"):
+            geometry.update_transform_matrix()
+
+        self._update_raycaster()
+        self.geometriesChanged.emit()
+        self.geometryAdded.emit(geometry)
+        return geometry
+
+    def _apply_default_physics_attrs(self, geometry):
+        try:
+            if geometry is None:
+                return
+            geo_type = getattr(geometry, 'type', None)
+            if geo_type in ('group', GeometryType.JOINT.value):
+                return
+
+            attrs = getattr(geometry, 'mjcf_attrs', None)
+            if not isinstance(attrs, dict):
+                attrs = {}
+
+            updated = False
+            for key, default_val in self._default_physics_attrs.items():
+                if key not in attrs:
+                    attrs[key] = default_val
+                    updated = True
+
+            if updated or getattr(geometry, 'mjcf_attrs', None) is not attrs:
+                geometry.mjcf_attrs = attrs
+        except Exception as exc:
+            print(f"[PhysicsAttrs] 设置默认物理属性失败: {exc}")
+
+    def _wrap_loaded_geometries(self, filename, geometries):
+        group_name = os.path.splitext(os.path.basename(filename))[0]
+        file_group = GeometryGroup(name=group_name, position=(0, 0, 0), rotation=(0, 0, 0))
+        file_group.source_file = filename
+        file_group._is_source_root = True
+        self._set_source_recursive(file_group, filename)
+
+        for geo in geometries:
+            file_group.add_child(geo)
+            self._set_source_recursive(geo, filename)
+
+        if hasattr(file_group, 'update_transform_matrix'):
+            file_group.update_transform_matrix()
+
+        return file_group
+
+    def _set_source_recursive(self, geometry, source_file):
+        try:
+            geometry.source_file = source_file
+        except Exception:
+            pass
+        if hasattr(geometry, 'children') and geometry.children:
+            for child in geometry.children:
+                self._set_source_recursive(child, source_file)
+
+    def _collect_export_objects(self, objects):
+        # 递归展开 source group 下的真实对象，忽略仅用于分组的根节点
+        export_list = []
+        for obj in objects:
+            if getattr(obj, '_is_source_root', False):
+                export_list.extend(self._collect_export_objects(obj.children))
+            else:
+                export_list.append(obj)
+        return export_list
+
+    def get_loaded_sources(self):
+        return list(self._source_groups.keys())
+
+    def save_loaded_sources(self):
+        failures = []
+        for path, group in self._source_groups.items():
+            export_objects = self._collect_export_objects(group.children)
+            try:
+                # 保存前激活对应文件的解析上下文，避免跨文件串改
+                XMLParser.activate_context(path)
+                ok = XMLParser.export_mujoco_xml(path, export_objects)
+            except Exception:
+                ok = False
+            if not ok:
+                failures.append(path)
+        return failures
+
+    def get_active_source_file(self):
+        return self._active_source_file
+
+    def get_source_group(self, source_file):
+        if not source_file:
+            return None
+        return self._source_groups.get(os.path.abspath(source_file))
+
+    def has_unsourced_geometry(self):
+        for geo in self.get_all_geometries():
+            if getattr(geo, 'source_file', None) is None:
+                return True
+        return False
+
+    def _auto_update_gizmo_size(self, geometry):
+        """根据当前对象的包围尺寸自动调整 Gizmo 的世界尺度"""
+        if geometry is None or getattr(geometry, "type", "") == "group":
+            return
+
+        max_dim = None
+
+        tris = getattr(geometry, "mesh_model_triangles", None)
+        if tris is not None and len(tris) > 0:
+            pts = np.asarray(tris, dtype=np.float32).reshape(-1, 3)
+            bounds = np.max(pts, axis=0) - np.min(pts, axis=0)
+            # mesh 以三角面包围盒的最大边长作为尺度参考
+            max_dim = float(np.max(np.abs(bounds)))
+
+        if max_dim is None or max_dim <= 1e-6:
+            size_attr = getattr(geometry, "size", None)
+            if size_attr is not None:
+                size_arr = np.abs(np.asarray(size_attr, dtype=float))
+                if size_arr.size > 0:
+                    # 原生 geom 以 size（半尺寸）推导直径，避免过小 gizmo
+                    max_dim = float(np.max(size_arr) * 2.0)
+
+        if max_dim is None or max_dim <= 1e-6:
+            # 兜底：给出一个可见的默认尺度
+            max_dim = 1.0
+
+        self.set_global_gizmo_size_world(max_dim)
+
+    def create_group(self, name=None, position=(0, 0, 0), rotation=(0, 0, 0), parent=None, source_file=None):
         """
         创建新的几何体组
         
@@ -196,9 +465,11 @@ class SceneViewModel(QObject):
             创建的几何体组对象
         """
         # 自动生成名称
+        existing_names = {geo.name for geo in self.get_all_geometries()}
         if name is None:
-            counter = sum(1 for g in self.get_all_geometries() if hasattr(g, 'type') and g.type == 'group')
-            name = f"Group{counter + 1}"
+            name = self._generate_unique_name("Group")
+        elif name in existing_names:
+            name = self._generate_unique_name(name)
         
         # 创建几何体组
         group = GeometryGroup(
@@ -207,12 +478,26 @@ class SceneViewModel(QObject):
             rotation=rotation,
             parent=parent
         )
+        if source_file is None:
+            if parent is not None:
+                source_file = getattr(parent, 'source_file', None)
+            else:
+                source_file = self._active_source_file
+        group.source_file = source_file
+        if source_file:
+            self._set_source_recursive(group, source_file)
         
         # 添加到场景中
         if parent:
             parent.add_child(group)
         else:
-            self._geometries.append(group)
+            target_group = None
+            if source_file and source_file in self._source_groups:
+                target_group = self._source_groups[source_file]
+            if target_group:
+                target_group.add_child(group)
+            else:
+                self._geometries.append(group)
         
         # 触发更新
         self.geometriesChanged.emit()
@@ -236,6 +521,11 @@ class SceneViewModel(QObject):
         # 从顶层列表中移除
         elif geometry in self._geometries:
             self._geometries.remove(geometry)
+
+        if getattr(geometry, '_is_source_root', False):
+            source = getattr(geometry, 'source_file', None)
+            if source and source in self._source_groups:
+                del self._source_groups[source]
         
         # 触发更新
         self.geometriesChanged.emit()
@@ -267,7 +557,7 @@ class SceneViewModel(QObject):
         """清除当前选择"""
         self.selected_geometry = None
     
-    def load_scene(self, filename):
+    def load_scene(self, filename, *, append=False):
         """
         从文件加载场景
         
@@ -278,7 +568,18 @@ class SceneViewModel(QObject):
             bool: 是否成功加载
         """
         try:
-            self._geometries = XMLParser.load(filename)
+            loaded_geos = XMLParser.load(filename)
+            abs_path = os.path.abspath(filename)
+
+            if not append:
+                self._geometries = []
+                self._source_groups = {}
+                self._active_source_file = None
+
+            file_group = self._wrap_loaded_geometries(abs_path, loaded_geos)
+            self._geometries.append(file_group)
+            self._source_groups[abs_path] = file_group
+            self._active_source_file = abs_path
             self._update_raycaster()
             self.geometriesChanged.emit()
             return True
@@ -286,7 +587,58 @@ class SceneViewModel(QObject):
             print(f"加载场景失败: {e}")
             return False
     
-    def save_scene(self, filename):
+    def _collect_unsourced_roots(self):
+        roots = []
+        seen = set()
+        for geo in self.get_all_geometries():
+            if getattr(geo, 'source_file', None) is not None:
+                continue
+            parent = getattr(geo, 'parent', None)
+            if parent is not None and getattr(parent, 'source_file', None) is None:
+                continue
+            if id(geo) not in seen:
+                roots.append(geo)
+                seen.add(id(geo))
+        return roots
+
+    def _attach_unsourced_to_file(self, filename, unsourced_roots):
+        if not unsourced_roots:
+            return
+        abs_path = os.path.abspath(filename)
+
+        base_name = os.path.splitext(os.path.basename(abs_path))[0] or "Scene"
+        existing = {geo.name for geo in self.get_all_geometries()}
+        if base_name in existing:
+            group_name = self._generate_unique_name(base_name)
+        else:
+            group_name = base_name
+        file_group = GeometryGroup(name=group_name, position=(0, 0, 0), rotation=(0, 0, 0))
+        file_group.source_file = abs_path
+        file_group._is_source_root = True
+
+        self._set_source_recursive(file_group, abs_path)
+
+        for obj in unsourced_roots:
+            parent = getattr(obj, 'parent', None)
+            if parent is not None and hasattr(parent, 'remove_child'):
+                try:
+                    parent.remove_child(obj)
+                except Exception:
+                    pass
+            if obj in self._geometries:
+                self._geometries.remove(obj)
+            file_group.add_child(obj)
+            self._set_source_recursive(obj, abs_path)
+
+        self._geometries.append(file_group)
+        self._source_groups[abs_path] = file_group
+        self._active_source_file = abs_path
+        XMLParser._store_context_for_file(abs_path)
+        XMLParser.activate_context(abs_path)
+        self._update_raycaster()
+        self.geometriesChanged.emit()
+
+    def save_scene(self, filename, *, include_unsourced_only=False):
         """
         保存场景到文件
         
@@ -301,7 +653,41 @@ class SceneViewModel(QObject):
             _, ext = os.path.splitext(filename)
             
             if ext.lower() == '.xml':
-                return XMLParser.export_mujoco_xml(filename, self._geometries)
+                unsourced_roots = []
+                if include_unsourced_only:
+                    unsourced_roots = self._collect_unsourced_roots()
+                    if not unsourced_roots:
+                        export_objects = self._collect_export_objects(self._geometries)
+                    else:
+                        export_objects = self._collect_export_objects(unsourced_roots)
+                else:
+                    export_objects = self._collect_export_objects(self._geometries)
+
+                context_path = None
+                if not include_unsourced_only:
+                    abs_target = os.path.abspath(filename)
+                    if abs_target in self._source_groups:
+                        context_path = abs_target
+                    elif self._active_source_file and self._active_source_file in self._source_groups:
+                        context_path = self._active_source_file
+                    elif len(self._source_groups) == 1:
+                        # 单文件场景另存为新路径时仍复用唯一来源的上下文，以保留 worldbody 之外的附加节点
+                        context_path = next(iter(self._source_groups.keys()))
+
+                if context_path:
+                    XMLParser.activate_context(context_path)
+                else:
+                    # 另存为仅包含未关联对象，或当前无匹配上下文时清空解析状态，回落到全新 MJCF 根
+                    XMLParser.activate_context(None)
+
+                ok = XMLParser.export_mujoco_xml(
+                    filename,
+                    export_objects,
+                    preserve_auxiliary=not include_unsourced_only
+                )
+                if ok and include_unsourced_only:
+                    self._attach_unsourced_to_file(filename, unsourced_roots)
+                return ok
             else:
                 return XMLParser.export_enhanced_xml(filename, self._geometries)
         except Exception as e:
@@ -397,12 +783,12 @@ class SceneViewModel(QObject):
         参数:
             obj: 被修改的对象
         """
-        # 更新所有变换矩阵
+        # 更新所有变换矩阵，确保父子层次的缓存与最新属性一致
         self.update_all_transform_matrices()
-        
+
         # 发出对象变化信号
         self.objectChanged.emit(obj)
-        
+
         # 如果对象在选择列表中，同时更新选择
         if obj == self._selected_geo:
             self.selectionChanged.emit(obj)
@@ -546,7 +932,7 @@ class SceneViewModel(QObject):
     def move_geometry(self, geometry, new_position):
         """
         移动几何体到新位置
-        
+
         参数:
             geometry: 要移动的几何体
             new_position: 新位置坐标
@@ -561,11 +947,265 @@ class SceneViewModel(QObject):
             self.notify_object_changed(geometry)
             self.geometryChanged.emit(geometry)
             print(f"发射了 geometryChanged 信号: {geometry.name}")
-    
+
+    def is_mesh_scale_editable(self, geometry):
+        """判断 mesh 资产是否允许在属性面板调节缩放"""
+        if geometry is None or getattr(geometry, 'mesh_name', None) is None:
+            return False
+        asset = XMLParser._mesh_assets.get(geometry.mesh_name)
+        if not asset:
+            return True
+        return True
+
+    def update_mesh_asset_scale(self, geometry, new_scale):
+        """修改 mesh 资产的统一缩放，并同步刷新所有引用该资产的几何体"""
+        if geometry is None or getattr(geometry, 'mesh_name', None) is None:
+            return False
+
+        try:
+            scale_arr = np.array(new_scale, dtype=float)
+        except Exception:
+            return False
+
+        if scale_arr.shape[0] != 3:
+            return False
+
+        scale_list = scale_arr.tolist()
+        mesh_name = geometry.mesh_name
+        asset_entry = XMLParser._mesh_assets.get(mesh_name)
+
+        if asset_entry is not None:
+            asset_entry['scale'] = scale_list
+            asset_entry['has_scale_attr'] = True
+            asset_entry['_is_new'] = False
+
+        # 更新所有引用的几何体
+        base_tris = None
+        base_norms = None
+        base_path = getattr(geometry, 'mesh_path', None)
+        if base_path and os.path.exists(base_path):
+            try:
+                base_tris, base_norms = load_mesh_file(base_path)
+            except Exception as exc:
+                print(f"[Mesh] 重新加载失败: {base_path} -> {exc}")
+                base_tris, base_norms = None, None
+
+        for geo in self.get_all_geometries():
+            if getattr(geo, 'mesh_name', None) == mesh_name:
+                # 对每个实例更新资产缩放，并根据最新几何数据重建缓存
+                geo.mesh_asset_scale = scale_list
+                self._rebuild_mesh_geometry(geo, tris=base_tris, norms=base_norms)
+
+        if hasattr(self, 'control_viewmodel') and self.control_viewmodel:
+            self.control_viewmodel._on_geometry_modified()
+
+        return True
+
+    def _rebuild_mesh_geometry(self, geometry, tris=None, norms=None):
+        """按最新资产缩放/文件内容重建 mesh 的局部数据"""
+        path = getattr(geometry, 'mesh_path', None)
+        if tris is None or norms is None:
+            if not path or not os.path.exists(path):
+                return
+            try:
+                tris, norms = load_mesh_file(path)
+            except Exception as exc:
+                print(f"[Mesh] 重新加载失败: {path} -> {exc}")
+                return
+
+        asset_scale = np.array(getattr(geometry, 'mesh_asset_scale', [1.0, 1.0, 1.0]), dtype=np.float32)
+        geom_scale = np.array(getattr(geometry, 'mesh_geom_scale', [1.0, 1.0, 1.0]), dtype=np.float32)
+        total_scale = asset_scale * geom_scale
+        tris_array = np.asarray(tris, dtype=np.float32)
+        tris_scaled = tris_array * total_scale.reshape(1, 1, 3)
+
+        # 基于缩放后的网格重新计算包围盒与中心
+        flat_pts = tris_scaled.reshape(-1, 3)
+        mins = flat_pts.min(axis=0)
+        maxs = flat_pts.max(axis=0)
+        center = (mins + maxs) * 0.5
+        half_extents = np.maximum((maxs - mins) * 0.5, 1e-5)
+
+        prev_offset = np.array(getattr(geometry, 'mesh_origin_offset', [0.0, 0.0, 0.0]), dtype=float)
+        geometry.mesh_origin_offset = center.astype(float).tolist()
+
+        geometry.mesh_model_triangles = (tris_scaled - center.reshape(1, 1, 3)).astype(np.float32)
+        if norms is None:
+            geometry.mesh_model_normals = None
+        else:
+            geometry.mesh_model_normals = np.asarray(norms, dtype=np.float32)
+        geometry.size = tuple(half_extents.tolist())
+
+        # 中心变化需要同步补偿到几何体世界位置
+        delta = center - prev_offset
+        geometry.position = (np.array(geometry.position, dtype=float) + delta).tolist()
+
+        if hasattr(geometry, 'update_transform_matrix'):
+            geometry.update_transform_matrix()
+
+        self.notify_object_changed(geometry)
+
+    def set_gs_background_state(self, entries, active_key, reset_history=False, emit=True):
+        """
+        同步高斯背景列表与当前激活项：
+        - entries: [{key, path}] 或 (key, path) 结构
+        - active_key: 当前激活的GS背景键值
+        - reset_history: 是否清空编辑历史及备份
+        - emit: 是否向外发射变化信号
+        """
+        normalized = []
+        for entry in entries or []:
+            # 归一化输入格式，统一为 {key, path} 字典
+            key = None
+            path = None
+            if isinstance(entry, dict):
+                key = entry.get('key')
+                path = entry.get('path')
+            elif isinstance(entry, (list, tuple)):
+                if len(entry) > 0:
+                    key = entry[0]
+                if len(entry) > 1:
+                    path = entry[1]
+            else:
+                continue
+            if not key:
+                continue
+            normalized.append({'key': key, 'path': path})
+
+        changed = (normalized != self._gs_backgrounds) or (active_key != self._gs_active_background)
+        # 仅当列表或激活项发生变化时才进一步处理
+
+        if reset_history:
+            # 需要重置时同时清理历史备份文件
+            self._clear_gs_edit_history(remove_files=True)
+
+        self._gs_backgrounds = normalized
+        self._gs_active_background = active_key
+
+        if emit and (changed or reset_history):
+            payload = [dict(item) for item in self._gs_backgrounds]
+            # 将最新状态广播给所有订阅方（如OpenGL视图、控制面板）
+            self.gsBackgroundsChanged.emit(payload, self._gs_active_background)
+
+        if reset_history and hasattr(self, 'control_viewmodel') and self.control_viewmodel:
+            try:
+                self.control_viewmodel.clear_history()
+                self.control_viewmodel.record_current_state()
+            except Exception as exc:
+                print(f"同步撤销栈失败: {exc}")
+
+    def get_gs_background_state(self):
+        """返回当前缓存的高斯背景列表与激活键"""
+        return list(self._gs_backgrounds), self._gs_active_background
+
+    def record_gs_edit(self, path, backup_path):
+        """记录一次对GS文件的修改及其备份，供撤销恢复使用"""
+        if not path or not backup_path:
+            return
+        # 记录元组 {原路径, 备份文件}，供撤销时恢复并清理
+        self._gs_edit_history.append({'path': os.path.abspath(path), 'backup': os.path.abspath(backup_path)})
+
+    def restore_gs_history_to(self, length):
+        """根据目标长度回滚高斯编辑历史，同时恢复备份文件"""
+        if length is None:
+            return
+        try:
+            target = max(0, int(length))
+        except Exception:
+            target = 0
+
+        refreshed = False
+        while len(self._gs_edit_history) > target:
+            record = self._gs_edit_history.pop()
+            backup = record.get('backup')
+            path = record.get('path')
+            refreshed = True
+            # 逐条回滚，必要时复制备份文件覆盖原PLY
+            if backup and path and os.path.exists(backup):
+                try:
+                    shutil.copy2(backup, path)
+                    refreshed = True
+                except Exception as e:
+                    print(f"恢复 PLY 失败: {e}")
+            if backup and os.path.exists(backup):
+                try:
+                    os.remove(backup)
+                except Exception:
+                    pass
+
+        if refreshed or target < len(self._gs_edit_history):
+            payload = [dict(item) for item in self._gs_backgrounds]
+            # 回滚后通知外部刷新界面
+            self.gsBackgroundsChanged.emit(payload, self._gs_active_background)
+
+    def _clear_gs_edit_history(self, remove_files=False):
+        """清理GS编辑历史，可选顺带删除备份文件"""
+        if remove_files:
+            for record in self._gs_edit_history:
+                backup = record.get('backup')
+                if backup and os.path.exists(backup):
+                    try:
+                        os.remove(backup)
+                    except Exception:
+                        pass
+        self._gs_edit_history = []
+
+    def get_gs_history_length(self):
+        """返回当前保存的GS编辑历史长度"""
+        return len(self._gs_edit_history)
+
+    def clear_gs_backups(self):
+        """外部调用入口：清理全部高斯背景备份并重置历史记录"""
+        self._clear_gs_edit_history(remove_files=True)
+
+    def _restore_mesh_geometry(self, geometry, mesh_info):
+        """根据存档信息还原 mesh 的资产/几何缓存，用于撤销或文件恢复"""
+        if geometry is None or not mesh_info:
+            return
+
+        mesh_path = mesh_info.get('path')
+        if mesh_path:
+            geometry.mesh_path = mesh_path
+        mesh_name = mesh_info.get('mesh_name')
+        if mesh_name:
+            geometry.mesh_name = mesh_name
+        if 'asset_scale' in mesh_info:
+            geometry.mesh_asset_scale = mesh_info.get('asset_scale') or [1.0, 1.0, 1.0]
+        if 'geom_scale' in mesh_info:
+            geometry.mesh_geom_scale = mesh_info.get('geom_scale') or [1.0, 1.0, 1.0]
+        if 'origin_offset' in mesh_info:
+            geometry.mesh_origin_offset = mesh_info.get('origin_offset') or [0.0, 0.0, 0.0]
+
+        # 优先使用存档自带的三角面数据，否则回退到重新读取文件
+        tris = mesh_info.get('triangles')
+        norms = mesh_info.get('normals')
+
+        if tris is not None:
+            geometry.mesh_model_triangles = np.array(tris, dtype=np.float32)
+        elif mesh_path and os.path.exists(mesh_path):
+            try:
+                loaded_tris, loaded_norms = load_mesh_file(mesh_path)
+                geometry.mesh_model_triangles = loaded_tris.astype(np.float32)
+                if norms is None:
+                    norms = loaded_norms
+            except Exception as exc:
+                print(f"[Mesh Restore] 加载失败: {mesh_path} -> {exc}")
+                geometry.mesh_model_triangles = np.empty((0, 3, 3), dtype=np.float32)
+        else:
+            geometry.mesh_model_triangles = np.empty((0, 3, 3), dtype=np.float32)
+
+        if norms is not None:
+            geometry.mesh_model_normals = np.array(norms, dtype=np.float32)
+        else:
+            geometry.mesh_model_normals = None
+
+        if hasattr(geometry, 'update_transform_matrix'):
+            geometry.update_transform_matrix()
+
     def get_serializable_geometries(self):
         """
         获取可序列化的几何体数据，包括所有嵌套的子对象
-        
+
         返回:
             dict: 包含所有几何体数据的字典
         """
@@ -596,6 +1236,34 @@ class SceneViewModel(QObject):
                 geo_data['properties'] = geo.get_specific_properties()
             else:
                 geo_data['properties'] = {}
+
+            # 记录 mesh 专属信息
+            mesh_info = {}
+            if getattr(geo, 'type', None) in (GeometryType.MESH.value, 'mesh'):
+                # 序列化资产路径、缩放与缓存的三角面，便于保存/撤销恢复
+                mesh_path = getattr(geo, 'mesh_path', None)
+                mesh_info['path'] = mesh_path
+                mesh_info['mesh_name'] = getattr(geo, 'mesh_name', None)
+                if hasattr(geo, 'mesh_asset_scale'):
+                    mesh_info['asset_scale'] = list(getattr(geo, 'mesh_asset_scale', []))
+                if hasattr(geo, 'mesh_geom_scale'):
+                    mesh_info['geom_scale'] = list(getattr(geo, 'mesh_geom_scale', []))
+                if hasattr(geo, 'mesh_origin_offset'):
+                    mesh_info['origin_offset'] = list(getattr(geo, 'mesh_origin_offset', []))
+
+                tris = getattr(geo, 'mesh_model_triangles', None)
+                if isinstance(tris, np.ndarray):
+                    mesh_info['triangles'] = tris.tolist()
+                elif isinstance(tris, list):
+                    mesh_info['triangles'] = tris
+
+                norms = getattr(geo, 'mesh_model_normals', None)
+                if isinstance(norms, np.ndarray):
+                    mesh_info['normals'] = norms.tolist()
+                elif isinstance(norms, list):
+                    mesh_info['normals'] = norms
+
+                geo_data['mesh_info'] = mesh_info
             
             # 添加当前几何体数据
             geometries_data.append(geo_data)
@@ -612,7 +1280,10 @@ class SceneViewModel(QObject):
         # 返回包含场景信息和几何体数据的字典
         return {
             'version': '1.0',
-            'geometries': geometries_data
+            'geometries': geometries_data,
+            'gs_backgrounds': [dict(item) for item in self._gs_backgrounds],
+            'gs_active_background': self._gs_active_background,
+            'gs_history_length': self.get_gs_history_length()
         }
     
     def load_geometries_from_data(self, data):
@@ -702,6 +1373,10 @@ class SceneViewModel(QObject):
                                         rotation=rotation,
                                         parent=parent_geo
                                     )
+                                    # Mesh 需要额外恢复网格数据
+                                    if gt == GeometryType.MESH and isinstance(geo_data.get('mesh_info'), dict):
+                                        mesh_info = geo_data.get('mesh_info')
+                                        self._restore_mesh_geometry(geo, mesh_info)
                                     
                                     # 设置颜色
                                     if hasattr(geo, 'material') and hasattr(geo.material, 'color'):
@@ -728,16 +1403,25 @@ class SceneViewModel(QObject):
             
             # 更新射线投射器
             self._update_raycaster()
-            
+
             # 清除当前选择
             self.clear_selection()
-            
+
+            # 恢复高斯背景状态
+            entries = data.get('gs_backgrounds', [])
+            active_key = data.get('gs_active_background')
+            history_len = data.get('gs_history_length')
+            if hasattr(self, 'set_gs_background_state'):
+                self.set_gs_background_state(entries, active_key, reset_history=False, emit=True)
+            if history_len is not None:
+                self.restore_gs_history_to(history_len)
+
             # 通知视图更新
             self.geometriesChanged.emit()
-            
+
             print(f"成功加载 {loaded_count} 个几何体")
             
-            return loaded_count > 0
+            return True
         except Exception as e:
             print(f"加载几何体数据失败: {str(e)}")
             import traceback
@@ -749,7 +1433,15 @@ class SceneViewModel(QObject):
         清除场景中的所有几何体
         """
         self._geometries = []
+        self._source_groups = {}
+        self._active_source_file = None
         self.geometriesChanged.emit()
+        self.set_gs_background_state([], None, reset_history=True, emit=True)
+        try:
+            XMLParser._context_by_file.clear()
+        except AttributeError:
+            pass
+        XMLParser.activate_context(None)
     
     def notifyPositionChanged(self, geometry):
         """通知几何体位置变化"""
@@ -791,6 +1483,7 @@ class SceneViewModel(QObject):
             return
         if getattr(self, "global_gizmo_size_world", None) != v:
             self.global_gizmo_size_world = v
+            # 向界面与 OpenGL 视图广播新的世界尺度
             self.gizmoSizeChanged.emit(v)
             # 通知重绘：任选一种你已有的刷新方式
             # try:

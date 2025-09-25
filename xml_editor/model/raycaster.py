@@ -198,6 +198,10 @@ class GeometryRaycaster:
             return self._intersect_ellipsoid(geometry, ray_origin, ray_direction)
         elif geometry.type == 'plane':
             return self._intersect_plane(geometry, ray_origin, ray_direction)
+        elif geometry.type == 'mesh':
+            return self._intersect_mesh(geometry, ray_origin, ray_direction)
+        elif geometry.type == 'joint':
+            return self._intersect_box(geometry, ray_origin, ray_direction)
         else:
             # 默认使用AABB（轴对齐包围盒）检测
             return self._intersect_aabb(geometry, ray_origin, ray_direction)
@@ -602,9 +606,64 @@ class GeometryRaycaster:
             normal = -ray_direction
         
         normal = normal / np.linalg.norm(normal)
-        
+
         return RaycastResult(geometry, t, hit_point, normal)
-    
+
+    def _intersect_mesh(self, geometry, ray_origin, ray_direction) -> RaycastResult:
+        """Mesh 几何拾取：使用局部三角面进行精确检测"""
+        triangles = getattr(geometry, 'mesh_model_triangles', None)
+        if triangles is None:
+            return RaycastResult()
+
+        if not isinstance(triangles, np.ndarray):
+            try:
+                triangles = np.asarray(triangles, dtype=np.float32)
+            except Exception:
+                triangles = np.empty((0, 3, 3), dtype=np.float32)
+
+        if triangles.size == 0:
+            return RaycastResult()
+
+        center = geometry.get_world_position()
+        rotation_matrix = geometry.transform_matrix[:3, :3]
+
+        local_origin, local_direction = self.transform_ray_to_local(
+            ray_origin, ray_direction, center, rotation_matrix)
+
+        flat_pts = triangles.reshape(-1, 3)
+        local_min = flat_pts.min(axis=0)
+        local_max = flat_pts.max(axis=0)
+
+        if not self._ray_intersects_aabb(local_origin, local_direction, local_min, local_max):
+            return RaycastResult()
+
+        best_t = float('inf')
+        best_point = None
+        best_normal = None
+
+        for tri in triangles:
+            hit = self._ray_triangle_intersection(local_origin, local_direction, tri)
+            if hit is None:
+                continue
+            t, local_point, local_normal = hit
+            if 0 <= t < best_t:
+                best_t = t
+                best_point = local_point
+                best_normal = local_normal
+
+        if best_point is None:
+            return RaycastResult()
+
+        world_hit = self.transform_point_to_world(best_point, center, rotation_matrix)
+        world_normal = rotation_matrix @ best_normal
+        norm = np.linalg.norm(world_normal)
+        if norm > 1e-8:
+            world_normal = world_normal / norm
+        else:
+            world_normal = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+        return RaycastResult(geometry, best_t, world_hit, world_normal)
+
     def _intersect_capsule(self, geometry, ray_origin, ray_direction) -> RaycastResult:
         """胶囊体碰撞检测"""
         # 从世界坐标系获取几何体数据
@@ -718,9 +777,70 @@ class GeometryRaycaster:
             world_normal = world_normal / np.linalg.norm(world_normal)
             
             return RaycastResult(geometry, min_t, world_hit, world_normal)
-        
+
         return RaycastResult()  # 未命中
-    
+
+    def _ray_intersects_aabb(self, origin, direction, aabb_min, aabb_max) -> bool:
+        """快速检测局部坐标射线与 AABB 是否相交"""
+        inv_dir = np.where(np.abs(direction) > 1e-8, 1.0 / direction, np.inf)
+
+        t1 = (aabb_min - origin) * inv_dir
+        t2 = (aabb_max - origin) * inv_dir
+
+        t_min = np.max(np.minimum(t1, t2))
+        t_max = np.min(np.maximum(t1, t2))
+
+        if np.isnan(t_min) or np.isnan(t_max):
+            return False
+
+        return t_max >= max(t_min, 0.0)
+
+    def _ray_triangle_intersection(self, origin, direction, triangle):
+        """Möller–Trumbore 算法"""
+        if triangle is None or len(triangle) != 3:
+            return None
+
+        v0 = np.asarray(triangle[0], dtype=np.float32)
+        v1 = np.asarray(triangle[1], dtype=np.float32)
+        v2 = np.asarray(triangle[2], dtype=np.float32)
+
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+
+        pvec = np.cross(direction, edge2)
+        det = np.dot(edge1, pvec)
+
+        if abs(det) < 1e-8:
+            return None
+
+        inv_det = 1.0 / det
+        tvec = origin - v0
+        u = np.dot(tvec, pvec) * inv_det
+        if u < 0.0 or u > 1.0:
+            return None
+
+        qvec = np.cross(tvec, edge1)
+        v = np.dot(direction, qvec) * inv_det
+        if v < 0.0 or u + v > 1.0:
+            return None
+
+        t = np.dot(edge2, qvec) * inv_det
+        if t <= 1e-8:
+            return None
+
+        hit_point = origin + direction * t
+        normal = np.cross(edge1, edge2)
+        norm = np.linalg.norm(normal)
+        if norm > 1e-8:
+            normal = normal / norm
+        else:
+            normal = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+        if np.dot(normal, direction) > 0:
+            normal = -normal
+
+        return t, hit_point, normal
+
     def transform_ray_to_local(self, ray_start, ray_direction, center, rotation):
         """将射线从世界坐标系转换到物体的局部坐标系"""
         # 先平移射线起点
@@ -749,9 +869,9 @@ class GeometryRaycaster:
         world_point = rotation @ local_point
         # 应用平移
         world_point = world_point + center
-        
+
         return world_point
-    
+
     def _intersect_rotation_ring(self, geometry, ray_origin, ray_direction) -> RaycastResult:
         """环形旋转控制器碰撞检测"""
         # 从世界坐标系获取几何体数据

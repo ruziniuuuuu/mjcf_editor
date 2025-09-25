@@ -9,14 +9,16 @@ from PyQt5.QtCore import Qt, QSize, QPoint, pyqtSignal, QTimer
 from PyQt5.QtGui import QMouseEvent, QWheelEvent, QKeyEvent
 
 import numpy as np
-import struct
 from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.GLUT import *  # 添加GLUT库导入
 import os, subprocess
 import math
+import shutil
+import datetime
 from pathlib import Path
 from ..model.geometry import GeometryType, OperationMode
+from ..utils.mesh_loader import load_mesh as load_mesh_file
 from ..viewmodel.scene_viewmodel import SceneViewModel
 from ..model.raycaster import GeometryRaycaster, RaycastResult
 from ..model.geometry import Geometry
@@ -121,15 +123,28 @@ class OpenGLView(QOpenGLWidget):
         # 拖拽预览数据
         self.drag_preview = {'active': False, 'position': None, 'type': None}
 
-        # yc   初始化gaussian renderer， 设置高斯背景ply
-        self.model_dict = {"background":"car_open.ply"}
-        self.gs_renderer = GSRenderer(self.model_dict, self.width(), self.height())
+        # yc   高斯渲染器延迟初始化，待用户加载PLY后再创建
+        self.model_dict = {}
+        self.gs_renderer = None
         self.gs_enable = False
         self.index = 0
 
         self.gs_offset_t = np.zeros(3)
         self.gs_offest_R = np.eye(3)
         self.full_filename = None
+        self.full_filenames = []
+        self._gs_source_files = {}
+        self._gs_keys = []
+        self._active_gs_key = None
+        # 高斯点云编辑时的临时备份目录，便于回撤/恢复
+        self._gs_backup_dir = (Path(__file__).resolve().parents[2] / "save" / "gs_backups")
+        try:
+            self._gs_backup_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        if hasattr(self._scene_viewmodel, 'set_gs_background_state'):
+            self._scene_viewmodel.set_gs_background_state([], None, reset_history=True, emit=False)
 
         #Mesh
         self.loaded_meshes = []  # 每项: {'path': str, 'triangles': (N,3,3) float32, 'normals': (N,3,3)或(N,3) 或 None}
@@ -177,29 +192,213 @@ class OpenGLView(QOpenGLWidget):
         """处理窗口大小变化事件"""
         glViewport(0, 0, width, height)
         # yc   高斯渲染的分辨率跟GL保持一致
-        self.gs_renderer.set_camera_resolution(height,width)
+        if self.gs_renderer is not None:
+            self.gs_renderer.set_camera_resolution(height, width)
         self._update_projection(width, height)
        
-    def set_gs_background(self, filename):
+    def set_gs_background(self, filename, *, reset_history=True):
+        """便捷地只加载一个高斯背景PLY文件"""
         if not filename:
             return
-        self.full_filename = filename
-        ply_filename = os.path.basename(filename)
-        self.model_dict["background"] = ply_filename
+        self.set_gs_backgrounds([filename], reset_history=reset_history)
+
+    def set_gs_backgrounds(self, filenames, *, sync_scene=True, reset_history=False):
+        """
+        批量加载或刷新高斯背景：
+        - filenames: 待载入的PLY绝对/相对路径列表
+        - sync_scene: 是否将结果回写到SceneViewModel保持数据同步
+        - reset_history: 是否清空高斯编辑的撤销历史
+        """
+        cleaned = [os.path.abspath(path) for path in filenames if path]
+        # 将路径规整为绝对路径，方便后续查找与比较
+
+        if not cleaned:
+            # 当没有有效文件时，完全清空高斯背景的缓存状态
+            self.model_dict = {}
+            self._gs_source_files = {}
+            self._gs_keys = []
+            self.full_filenames = []
+            self.full_filename = None
+            self.gs_renderer = None
+            self.gs_enable = False
+            self._active_gs_key = None
+            self.update()
+            if sync_scene and hasattr(self._scene_viewmodel, 'set_gs_background_state'):
+                self._scene_viewmodel.set_gs_background_state([], None, reset_history=reset_history)
+            return
+
+        self.full_filenames = cleaned
+        self.full_filename = cleaned[0]
+
+        model_dict = {}
+        source_map = {}
+        used_keys = set()
+        gs_keys = []
+
+        for idx, path in enumerate(cleaned):
+            # 为每个PLY生成唯一键值，避免不同文件互相覆盖
+            base_name = os.path.basename(path)
+            key = "background" if idx == 0 else Path(base_name).stem or f"ply_{idx}"
+            suffix = 1
+            original_key = key
+            while key in used_keys:
+                key = f"{original_key}_{suffix}"
+                suffix += 1
+            used_keys.add(key)
+            model_dict[key] = base_name    # 键 -> 纯文件名
+            source_map[key] = path         # 键 -> 绝对路径
+            gs_keys.append(key)            # 保留导入顺序
+
+        self.model_dict = model_dict
+        self._gs_source_files = source_map
+        self._gs_keys = gs_keys
+
         try:
+            # 构造高斯渲染器并立即绑定当前窗口尺寸
             self.gs_renderer = GSRenderer(self.model_dict, self.width(), self.height())
         except Exception as e:
+            self.gs_renderer = None
             self.gs_enable = False
             print(f"Error: {e}")
+            return
+
         self.gs_enable = True
+        # 重置纹理缓存，确保下次绘制时重新上传画面
         self.gs_tex_width = None
         self.gs_tex_height = None
+        self._active_gs_key = gs_keys[0] if gs_keys else None
+        self.full_filename = source_map.get(self._active_gs_key) if self._active_gs_key else None
         self.update()
-    
+
+        if sync_scene and hasattr(self._scene_viewmodel, 'set_gs_background_state'):
+            # 向场景层同步最新的PLY列表与当前激活项，实现视图与数据统一
+            entries = [{'key': key, 'path': source_map.get(key)} for key in gs_keys]
+            self._scene_viewmodel.set_gs_background_state(entries, self._active_gs_key, reset_history=reset_history)
+
+    def update_gs_backgrounds_from_scene(self, entries, active_key):
+        # 由视图模型回调，驱动OpenGL视图重载高斯背景资源
+        paths = [entry.get('path', '') for entry in entries if entry.get('path')]
+        norm_paths = [os.path.abspath(p) for p in paths]
+        self.set_gs_backgrounds(norm_paths, sync_scene=False, reset_history=False)
+
+        if active_key:
+            # 仅更新本地激活项，避免重复向SceneViewModel回写
+            self.set_active_gs_background(active_key, sync_scene=False)
+        else:
+            self._active_gs_key = None
+            self.full_filename = None
+
+    def set_active_gs_background(self, key, *, sync_scene=True):
+        """设置当前操作的 PLY 键"""
+        if not key:
+            return
+        path = self._gs_source_files.get(key)
+        if not path:
+            return
+        self._active_gs_key = key
+        # 记录当前激活PLY的绝对路径，供编辑命令与渲染使用
+        self.full_filename = path
+        if sync_scene and hasattr(self._scene_viewmodel, 'set_gs_background_state'):
+            # 只有在本地触发切换时，才回写给SceneViewModel同步状态
+            entries = [{'key': k, 'path': self._gs_source_files.get(k)} for k in self._gs_keys]
+            self._scene_viewmodel.set_gs_background_state(entries, self._active_gs_key)
+
+    def set_active_gs_background_by_path(self, path):
+        """通过绝对路径反查并激活对应的GS背景"""
+        if not path:
+            return
+        for k, abs_path in self._gs_source_files.items():
+            if os.path.abspath(abs_path) == os.path.abspath(path):
+                # 比对绝对路径，找到对应的键后仅更新本地状态
+                self.set_active_gs_background(k, sync_scene=False)
+                break
+
+    def get_gs_background_entries(self):
+        """返回当前已加载的 PLY 列表 (key, path)"""
+        return [(key, self._gs_source_files.get(key, "")) for key in self._gs_keys]
+
     # yc 得到高斯渲染结果 numpy数组
     def get_gs_result(self):
+        """获取当前相机姿态下的高斯渲染输出(返回numpy数组)"""
+        if self.gs_renderer is None:
+            return None
+        # 每次渲染前先同步最新的相机位姿
         self.gs_renderer.renderer.update_camera_pose(self.gs_renderer.camera)
         return self.gs_renderer.render()
+
+    def _draw_gs_background(self):
+        """在OpenGL帧缓冲上绘制GS渲染结果，保持深度与混合状态一致"""
+        lighting_was_on = glIsEnabled(GL_LIGHTING)
+        depth_was_on = glIsEnabled(GL_DEPTH_TEST)
+        blend_was_on = glIsEnabled(GL_BLEND)
+
+        if lighting_was_on:
+            glDisable(GL_LIGHTING)
+        if depth_was_on:
+            glDisable(GL_DEPTH_TEST)
+        if blend_was_on:
+            glDisable(GL_BLEND)
+
+        # 拉取一帧高斯渲染结果，如果为空直接恢复状态
+        gs_result = self.get_gs_result()
+        if gs_result is None:
+            if lighting_was_on:
+                glEnable(GL_LIGHTING)
+            if depth_was_on:
+                glEnable(GL_DEPTH_TEST)
+            if blend_was_on:
+                glEnable(GL_BLEND)
+            return
+
+        # OpenGL纹理坐标原点在左下，需要翻转图像保持方向一致
+        gs_result = np.flipud(gs_result)
+        height, width, _ = gs_result.shape
+        print("gs shape", gs_result.shape)
+
+        if (not hasattr(self, "gs_texture") or
+            width != getattr(self, "gs_tex_width", None) or
+            height != getattr(self, "gs_tex_height", None)):
+            # 尺寸发生变化时重新申请纹理，避免越界
+            self.initialize_gs_texture(width, height)
+
+        glBindTexture(GL_TEXTURE_2D, self.gs_texture)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
+                        GL_RGB, GL_UNSIGNED_BYTE, gs_result)
+
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, 1, 0, 1, -1, 1)
+
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, self.gs_texture)
+        glColor4f(1.0, 1.0, 1.0, 1.0)
+
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 0); glVertex2f(0, 0)
+        glTexCoord2f(1, 0); glVertex2f(1, 0)
+        glTexCoord2f(1, 1); glVertex2f(1, 1)
+        glTexCoord2f(0, 1); glVertex2f(0, 1)
+        glEnd()
+
+        glDisable(GL_TEXTURE_2D)
+
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+        glPopMatrix()
+
+        if blend_was_on:
+            glEnable(GL_BLEND)
+        if depth_was_on:
+            glEnable(GL_DEPTH_TEST)
+        if lighting_was_on:
+            glEnable(GL_LIGHTING)
     
     def initialize_gs_texture(self, width, height):
         """初始化 gs 纹理（或重新分配尺寸）"""
@@ -264,7 +463,11 @@ class OpenGLView(QOpenGLWidget):
         # 更新摄像机配置到场景视图模型
         self._update_camera_config()
         
-        # 渲染顺序：先绘制网格和几何体
+        # 渲染顺序：先绘制背景，再绘制场景
+        if self.gs_enable and self.gs_renderer is not None:
+            self._draw_gs_background()
+        
+        # 绘制网格和几何体
         
         # 绘制网格
         self._draw_grid()
@@ -273,6 +476,9 @@ class OpenGLView(QOpenGLWidget):
         for geometry in self._scene_viewmodel.geometries:
             self._draw_geometry(geometry)
             
+        # 绘制通过 MJCF 加载的 mesh 几何
+        # self._draw_mesh_geometries()
+
         # 绘制通过 OBJ/STL 打开的网格
         self._draw_loaded_meshes()
 
@@ -294,68 +500,6 @@ class OpenGLView(QOpenGLWidget):
             glDisable(GL_DEPTH_TEST)
             self._draw_drag_preview()
             glEnable(GL_DEPTH_TEST)
-
-        # ---- 2. 获取高斯渲染结果 ----
-        if self.gs_enable:
-            gs_result = self.get_gs_result()      
-            # cv.imwrite(f'./test.png', gs_result)
-            # if self.animation:
-            #     img = self.animation_imgs[self.frame_index]
-            #     mask = self.masks[self.frame_index]
-            #     self.frame_index += 1
-            #     gs_result =  np.where(mask.astype(bool), gs_result, img)
-            #     if self.frame_index > self.num_frames-1:
-            #         self.animation = False
-            # 垂直翻转，需要的话（openGL以左下角为原点）
-            gs_result = np.flipud(gs_result)
-
-            
-            height,width,_ = gs_result.shape
-            print("gs shape",gs_result.shape)
-
-            # ---- 3. 初始化/检查纹理尺寸 ----
-            if (not hasattr(self, "gs_texture") or
-                width != getattr(self, "gs_tex_width", None) or
-                height != getattr(self, "gs_tex_height", None)):
-                self.initialize_gs_texture(width, height)
-
-            # ---- 4. 更新纹理内容 ----
-            glBindTexture(GL_TEXTURE_2D, self.gs_texture)
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)  # 确保对齐
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height,
-                            GL_RGB, GL_UNSIGNED_BYTE, gs_result)
-
-            # ---- 5. 绘制全屏 Quad ----
-            glEnable(GL_BLEND)
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-            glMatrixMode(GL_PROJECTION)
-            glPushMatrix()
-            glLoadIdentity()
-            glOrtho(0, 1, 0, 1, -1, 1)
-
-            glMatrixMode(GL_MODELVIEW)
-            glPushMatrix()
-            glLoadIdentity()
-
-            glEnable(GL_TEXTURE_2D)
-            glBindTexture(GL_TEXTURE_2D, self.gs_texture)
-            glColor4f(1, 1, 1, 0.5)  # 半透明叠加
-
-            glBegin(GL_QUADS)
-            glTexCoord2f(0, 0); glVertex2f(0, 0)
-            glTexCoord2f(1, 0); glVertex2f(1, 0)
-            glTexCoord2f(1, 1); glVertex2f(1, 1)
-            glTexCoord2f(0, 1); glVertex2f(0, 1)
-            glEnd()
-
-            glDisable(GL_TEXTURE_2D)
-            glDisable(GL_BLEND)
-
-            glMatrixMode(GL_PROJECTION)
-            glPopMatrix()
-            glMatrixMode(GL_MODELVIEW)
-            glPopMatrix()
 
             glBindTexture(GL_TEXTURE_2D, 0)
         
@@ -416,8 +560,9 @@ class OpenGLView(QOpenGLWidget):
         #     except Exception:
         #         pass   
         # 更新高斯渲染的相机视角
-        self.gs_renderer.camera.position = camera_position
-        self.gs_renderer.camera.target = self._camera_target
+        if self.gs_renderer is not None:
+            self.gs_renderer.camera.position = camera_position
+            self.gs_renderer.camera.target = self._camera_target
         print("camera_position", camera_position)
         print('target position',self._camera_target)
         print('camera distance',self._camera_distance)
@@ -586,20 +731,141 @@ class OpenGLView(QOpenGLWidget):
             self._draw_plane()
         elif geometry.type == GeometryType.ELLIPSOID.value:
             self._draw_ellipsoid(geometry.size[0], geometry.size[1], geometry.size[2])
+        elif geometry.type == GeometryType.MESH.value:
+            self._draw_mesh_geometry(geometry)
+        elif geometry.type == GeometryType.JOINT.value:
+            self._draw_joint(geometry)
         else:
             # 默认使用立方体
             self._draw_box(geometry.size[0], geometry.size[1], geometry.size[2])
-        
+
         # 如果被选中，绘制包围盒
         if selected:
             if geometry.type == GeometryType.CAPSULE.value:
-                # 胶囊体的包围盒需要考虑半球部分
-                self._draw_wireframe_cube(geometry.size[0], geometry.size[0], geometry.size[2]+ geometry.size[0], highlight=True)
+                self._draw_wireframe_cube(geometry.size[0], geometry.size[0], geometry.size[2] + geometry.size[0], highlight=True)
+            elif geometry.type == GeometryType.MESH.value:
+                self._draw_mesh_wireframe(geometry)
             else:
                 self._draw_wireframe_cube(geometry.size[0], geometry.size[1], geometry.size[2], highlight=True)
+
+    def _draw_mesh_geometry(self, geometry):
+        """Render mesh geometry using cached triangles."""
+
+        tris = getattr(geometry, "mesh_model_triangles", None)
+        if tris is None or len(tris) == 0:
+            return
+
+        norms = getattr(geometry, "mesh_model_normals", None)
+
+        glBegin(GL_TRIANGLES)
+        if norms is None:
+            for tri in tris:
+                v0, v1, v2 = tri
+                n = np.cross(v1 - v0, v2 - v0)
+                ln = np.linalg.norm(n) + 1e-12
+                n = n / ln
+                glNormal3f(float(n[0]), float(n[1]), float(n[2]))
+                glVertex3f(float(v0[0]), float(v0[1]), float(v0[2]))
+                glVertex3f(float(v1[0]), float(v1[1]), float(v1[2]))
+                glVertex3f(float(v2[0]), float(v2[1]), float(v2[2]))
+        elif norms.ndim == 2:
+            for tri, n in zip(tris, norms):
+                glNormal3f(float(n[0]), float(n[1]), float(n[2]))
+                glVertex3f(float(tri[0][0]), float(tri[0][1]), float(tri[0][2]))
+                glVertex3f(float(tri[1][0]), float(tri[1][1]), float(tri[1][2]))
+                glVertex3f(float(tri[2][0]), float(tri[2][1]), float(tri[2][2]))
+        else:
+            for tri, n3 in zip(tris, norms):
+                for v, n in zip(tri, n3):
+                    glNormal3f(float(n[0]), float(n[1]), float(n[2]))
+                    glVertex3f(float(v[0]), float(v[1]), float(v[2]))
+        glEnd()
+
+    def _draw_joint(self, geometry):
+        """使用加粗线段绘制关节轴向"""
+        length = float(geometry.size[0]) * 2.0 if len(geometry.size) > 0 else 0.4
+        half_len = length * 0.5
+        thickness = max(float(geometry.size[1]) if len(geometry.size) > 1 else 0.02,
+                        float(geometry.size[2]) if len(geometry.size) > 2 else 0.02)
+
+        previous_line_width = glGetFloatv(GL_LINE_WIDTH)
+        glDisable(GL_LIGHTING)
+
+        line_width = max(2.0, thickness * 200.0)
+        glLineWidth(line_width)
+
+        glBegin(GL_LINES)
+        glVertex3f(-half_len, 0.0, 0.0)
+        glVertex3f(half_len, 0.0, 0.0)
+        glEnd()
+
+        glEnable(GL_LIGHTING)
+
+        # 在两端绘制小球提升可视化效果
+        glPushMatrix()
+        glTranslatef(-half_len, 0.0, 0.0)
+        glutSolidSphere(thickness * 1.5, 12, 12)
+        glPopMatrix()
+
+        glPushMatrix()
+        glTranslatef(half_len, 0.0, 0.0)
+        glutSolidSphere(thickness * 1.5, 12, 12)
+        glPopMatrix()
+
+        glLineWidth(previous_line_width)
+
+    def _draw_joint_preview(self, size):
+        """在拖拽预览阶段绘制关节简图"""
+        half_len = float(size[0]) if len(size) > 0 else 0.2
+        length = max(half_len * 2.0, 1e-4)
+        half_len = length * 0.5
+        thickness = 0.02
+        if len(size) > 1:
+            thickness = max(thickness, float(size[1]))
+        if len(size) > 2:
+            thickness = max(thickness, float(size[2]))
+
+        prev_lighting = glIsEnabled(GL_LIGHTING)
+        prev_width = glGetFloatv(GL_LINE_WIDTH)
+        glDisable(GL_LIGHTING)
+        glLineWidth(max(2.0, thickness * 200.0))
+
+        glBegin(GL_LINES)
+        glVertex3f(-half_len, 0.0, 0.0)
+        glVertex3f(half_len, 0.0, 0.0)
+        glEnd()
+
+        if prev_lighting:
+            glEnable(GL_LIGHTING)
+        else:
+            glDisable(GL_LIGHTING)
+        glLineWidth(prev_width)
+
+    def _draw_mesh_wireframe(self, geometry):
+        """Draw a bounding wireframe for selected mesh geometry."""
+
+        tris = getattr(geometry, "mesh_model_triangles", None)
+        if tris is None or len(tris) == 0:
+            return
+
+        pts = tris.reshape(-1, 3)
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        cx = (mins[0] + maxs[0]) * 0.5
+        cy = (mins[1] + maxs[1]) * 0.5
+        cz = (mins[2] + maxs[2]) * 0.5
+        hx = max((maxs[0] - mins[0]) * 0.5, 1e-5)
+        hy = max((maxs[1] - mins[1]) * 0.5, 1e-5)
+        hz = max((maxs[2] - mins[2]) * 0.5, 1e-5)
+
+        glPushMatrix()
+        glTranslatef(float(cx), float(cy), float(cz))
+        self._draw_wireframe_cube(hx, hy, hz, highlight=True)
+        glPopMatrix()
         
     def _draw_translation_gizmo(self):
         """绘制平移控制器"""
+        # 关闭光照，确保轴线使用纯色着色，不受场景灯光影响
         glDisable(GL_LIGHTING)
         
         # 保存当前的线宽
@@ -671,6 +937,7 @@ class OpenGLView(QOpenGLWidget):
 
     def _draw_rotation_gizmo(self):
         """绘制旋转控制器 - 使用与平移控制器相同的样式"""
+        # 旋转 Gizmo 同样以纯色线条绘制，因此临时关闭光照与混合
         glDisable(GL_LIGHTING)
         
 
@@ -994,35 +1261,32 @@ class OpenGLView(QOpenGLWidget):
         self._last_mouse_pos = event.pos()
         self._is_mouse_pressed = True
         
-        # 如果有选中的对象且处于操作模式，尝试拾取变换控制器
         selected_geo = self._scene_viewmodel.selected_geometry
         operation_mode = self._scene_viewmodel.operation_mode
-        
-        if selected_geo and operation_mode != OperationMode.OBSERVE and selected_geo.visible:
-            # 射线投射，检查是否点击到了控制器
+
+        # 如果有选中的对象且处于操作模式，尝试拾取变换控制器
+        if (selected_geo and operation_mode != OperationMode.OBSERVE and selected_geo.visible
+                and event.button() == Qt.LeftButton):
             axis = self._pick_controller(event.x(), event.y())
             if axis:
                 self._dragging_controller = True
                 self._controller_axis = axis
                 self._drag_start_pos = event.pos()
-                self._drag_start_value = None  # 将在首次拖动时设置
-                
-                # 强制重绘以显示高亮效果
+                self._drag_start_value = None
                 self.update()
                 return
-        
+
+        clicked_geo = None
+        if event.button() == Qt.LeftButton:
+            clicked_geo = self._scene_viewmodel.get_geometry_at(event.x(), event.y(), self.width(), self.height())
+
         # 选择或取消选择对象
         if event.button() == Qt.LeftButton:
-            # 获取当前鼠标位置的几何体
-            clicked_geo = self._scene_viewmodel.get_geometry_at(event.x(), event.y(), self.width(), self.height())
-            
-            # 如果点击的是当前已选中的几何体，则取消选择
-            if clicked_geo == self._scene_viewmodel.selected_geometry:
+            if clicked_geo == self._scene_viewmodel.selected_geometry and clicked_geo is not None:
                 self._scene_viewmodel.clear_selection()
-            # 否则，选择点击的几何体
             elif clicked_geo:
+                # 左键点击几何体时，更新 SceneViewModel.selection 并让 Gizmo/模式联动
                 self._scene_viewmodel.selected_geometry = clicked_geo
-            # 如果没有点击到任何几何体，清除选择
             else:
                 self._scene_viewmodel.clear_selection()
         
@@ -1217,6 +1481,7 @@ class OpenGLView(QOpenGLWidget):
         """处理对象属性变化事件"""
         if obj == self._scene_viewmodel.selected_geometry:
             self._update_controllor_raycaster()
+        # 触发重新绘制，让不同模式的 Gizmo 立即刷新
         self.update()
 
     def _on_operation_mode_changed(self, mode):
@@ -1589,10 +1854,10 @@ class OpenGLView(QOpenGLWidget):
        
         if not selected_obj:
             return None
-        
-        #LZQ:0903
+
         # 尝试使用距离检测法检测点击
         if getattr(self, "_debug_pick_by_distance", True):
+            # 使用视图模型维护的世界尺度参数控制 Gizmo 轴长与拾取半径
             axis_length = float(getattr(self._scene_viewmodel, "global_gizmo_size_world", 0.5))
             inner_gap   = 0.1 * axis_length
             pick_radius = 0.08 * axis_length   # 可按手感调 0.06~0.12
@@ -1623,7 +1888,7 @@ class OpenGLView(QOpenGLWidget):
         try:
             # 使用控制器射线投射器检测点击
             result = self._controllor_raycaster.raycast(screen_x, screen_y, self.width(), self.height())
-            
+
             if result and result.is_hit():
                 # 查找控制器类型
                 geo = result.geometry
@@ -2095,34 +2360,41 @@ class OpenGLView(QOpenGLWidget):
             matrix = transform_matrix.T.flatten().tolist()
             glMultMatrixf(matrix)
         
-        # 设置混合模式，使控制器在几何体上方清晰可见
-        glEnable(GL_BLEND)
+        prev_blend = glIsEnabled(GL_BLEND)
+        prev_lighting = glIsEnabled(GL_LIGHTING)
+        prev_color = glGetFloatv(GL_CURRENT_COLOR)
+
+        if not prev_blend:
+            glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        
-        # 绘制坐标系指示器
         glDisable(GL_LIGHTING)
-        
-        # 绘制坐标系标志
+
         coord_label = "局部坐标系" if self._use_local_coords else "全局坐标系"
         self._draw_coordinate_label(coord_label)
-        
-        glEnable(GL_LIGHTING)
 
-        #LZQ：0904
-        #固定坐标系大小
-        size_world = getattr(self._scene_viewmodel, "global_gizmo_size_world", 1.0)
-        s = float(size_world) / 2.0
+        if prev_lighting:
+            glEnable(GL_LIGHTING)
+
+        # 统一的世界尺度决定三种 Gizmo 的体积与透明度表现
+        size_world = float(getattr(self._scene_viewmodel, "global_gizmo_size_world", 1.0))
+        s = size_world / 2.0
         glScalef(s, s, s)
 
-        # 绘制相应的控制器
         if operation_mode == OperationMode.TRANSLATE:
             self._draw_translation_gizmo()
         elif operation_mode == OperationMode.ROTATE:
             self._draw_rotation_gizmo()
         elif operation_mode == OperationMode.SCALE:
             self._draw_scale_gizmo()
-        
-        # 恢复矩阵
+
+        if prev_lighting:
+            glEnable(GL_LIGHTING)
+        else:
+            glDisable(GL_LIGHTING)
+        if not prev_blend:
+            glDisable(GL_BLEND)
+        glColor4f(float(prev_color[0]), float(prev_color[1]), float(prev_color[2]), float(prev_color[3]))
+
         glPopMatrix()
 
     def _draw_coordinate_label(self, label_text):
@@ -2306,18 +2578,23 @@ class OpenGLView(QOpenGLWidget):
     def _create_geometry_at_position(self, geo_type_value, position):
         """
         在指定位置创建几何体
-        
+
         参数:
             geo_type_value: 几何体类型值（字符串）
             position: 位置坐标
         """
         try:
+            variant = None
+            base_value = geo_type_value
+            if isinstance(geo_type_value, str) and ':' in geo_type_value:
+                base_value, variant = geo_type_value.split(':', 1)
+
             # 将字符串值转换为GeometryType枚举
             geo_type = None
             
             # 遍历所有几何体类型，找到匹配的值
             for gt in GeometryType:
-                if gt.value == geo_type_value:
+                if gt.value == base_value:
                     geo_type = gt
                     break
             
@@ -2326,7 +2603,23 @@ class OpenGLView(QOpenGLWidget):
                 print(f"错误：无效的几何体类型值 '{geo_type_value}'")
                 print(f"有效的几何体类型值: {[gt.value for gt in GeometryType]}")
                 return
-            
+
+            selected = self._scene_viewmodel.selected_geometry
+            parent_group = None
+            if selected is not None:
+                if getattr(selected, 'type', None) == 'group' and getattr(selected, '_is_source_root', False):
+                    parent_group = selected
+                elif getattr(selected, 'type', None) == 'group':
+                    parent_group = selected
+                else:
+                    ancestor = getattr(selected, 'parent', None)
+                    if getattr(ancestor, 'type', None) == 'group':
+                        parent_group = ancestor
+
+            active_source = self._scene_viewmodel.get_active_source_file()
+            if parent_group is None and active_source:
+                parent_group = self._scene_viewmodel.get_source_group(active_source)
+
             # 为不同几何体类型设置默认尺寸
             default_sizes = {
                 GeometryType.BOX: (0.5, 0.5, 0.5),
@@ -2334,16 +2627,36 @@ class OpenGLView(QOpenGLWidget):
                 GeometryType.CYLINDER: (0.5, 0.5, 0.5),
                 GeometryType.PLANE: (1.0, 0.01, 1.0),
                 GeometryType.CAPSULE: (0.5, 0.5, 0.5),
-                GeometryType.ELLIPSOID: (0.5, 0.3, 0.5)
+                GeometryType.ELLIPSOID: (0.5, 0.3, 0.5),
+                GeometryType.JOINT: (0.2, 0.02, 0.02)
             }
             
             # 创建几何体
             geometry = self._scene_viewmodel.create_geometry(
                 geo_type=geo_type,
                 position=tuple(position),
-                size=default_sizes.get(geo_type, (0.5, 0.5, 0.5))
+                size=default_sizes.get(geo_type, (0.5, 0.5, 0.5)),
+                parent=parent_group,
+                source_file=getattr(parent_group, 'source_file', None) if parent_group else active_source
             )
-            
+
+            # 针对关节类型，补充默认属性
+            if geometry and geo_type == GeometryType.JOINT:
+                joint_type = (variant or "hinge").lower()
+                if joint_type not in ("hinge", "slide"):
+                    joint_type = "hinge"
+                geometry.joint_type = joint_type
+                if not hasattr(geometry, 'joint_attrs') or not isinstance(getattr(geometry, 'joint_attrs'), dict):
+                    geometry.joint_attrs = {}
+                geometry.joint_attrs['type'] = joint_type
+                geometry.mjcf_attrs = {'type': joint_type}
+                # 调整默认颜色以区分不同关节
+                if hasattr(geometry, 'material') and hasattr(geometry.material, 'color'):
+                    if joint_type == 'hinge':
+                        geometry.material.color = (1.0, 0.9, 0.2, 1.0)
+                    else:
+                        geometry.material.color = (0.4, 0.8, 1.0, 1.0)
+
             # 选中新创建的几何体
             if geometry:
                 self._scene_viewmodel.selected_geometry = geometry
@@ -2364,14 +2677,19 @@ class OpenGLView(QOpenGLWidget):
         
         position = self.drag_preview['position']
         geo_type_value = self.drag_preview['type']
-        
+
         try:
+            variant = None
+            base_value = geo_type_value
+            if isinstance(geo_type_value, str) and ':' in geo_type_value:
+                base_value, variant = geo_type_value.split(':', 1)
+
             # 转换为GeometryType枚举
             geo_type = None
             
             # 遍历所有几何体类型，找到匹配的值
             for gt in GeometryType:
-                if gt.value == geo_type_value:
+                if gt.value == base_value:
                     geo_type = gt
                     break
             
@@ -2396,7 +2714,8 @@ class OpenGLView(QOpenGLWidget):
                 GeometryType.CYLINDER: (0.5, 0.5, 0.5),
                 GeometryType.PLANE: (1.0, 0.01, 1.0),
                 GeometryType.CAPSULE: (0.5, 0.5, 0.5),
-                GeometryType.ELLIPSOID: (0.5, 0.3, 0.5)
+                GeometryType.ELLIPSOID: (0.5, 0.3, 0.5),
+                GeometryType.JOINT: (0.2, 0.02, 0.02)
             }
             
             # 获取默认尺寸
@@ -2415,6 +2734,8 @@ class OpenGLView(QOpenGLWidget):
                 self._draw_plane()
             elif geo_type == GeometryType.ELLIPSOID:
                 self._draw_ellipsoid(size[0], size[1], size[2])
+            elif geo_type == GeometryType.JOINT:
+                self._draw_joint_preview(size)
             
             # 恢复状态
             glPopMatrix()
@@ -2645,12 +2966,71 @@ class OpenGLView(QOpenGLWidget):
             coord_system = "局部坐标系" if self._use_local_coords else "全局坐标系"
             parent_window.statusBar().showMessage(f"当前模式: {coord_system}", 2000)
 
-    def apply_gsply_transform(self, t_tuple, q_tuple):
+    def clear_loaded_meshes(self):
+        """清空通过 OBJ/STL 加载的网格"""
+        self.loaded_meshes.clear()
+        self.update()
+
+    def load_mesh_instances(self, instances):
         """
-        使用 gsply_edit.py 对“当前背景 PLY”就地覆盖写（-o 同一路径），然后重载同名文件。
-        t_tuple: (tx,ty,tz)   世界系平移（Z-up）
-        q_tuple: (qx,qy,qz,qw) 四元数（xyzw）
+        根据 XMLParser.get_mesh_instances() 的输出加载网格并预变换到世界坐标
+        instances: list of {"path","scale","transform","color"}
         """
+        # 用于 XML/MJCF 导入的批量 mesh，可保持与场景同步
+        # 每次加载新场景，先清掉旧的
+        self.loaded_meshes.clear()
+
+        for inst in instances:
+            path = inst.get("path", "")
+            if not path or not os.path.exists(path):
+                print(f"[Mesh] 找不到文件: {path}")
+                continue
+
+            try:
+                tris, norms = load_mesh_file(path)
+            except Exception as exc:
+                print(f"[Mesh] 加载失败: {path} -> {exc}")
+                continue
+
+            if tris is None or len(tris) == 0:
+                continue
+
+            # 1) 缩放
+            s = np.array(inst.get("scale", [1,1,1]), dtype=np.float32).reshape(1,1,3)
+            tris = tris * s
+
+            # 2) 世界变换（R,t）
+            M = np.array(inst.get("transform", np.eye(4)), dtype=np.float32)
+            # 解析 matrix，将静态 mesh 变换到世界坐标，便于直接绘制
+            if M.shape == (4,4):
+                Rm = M[:3,:3]
+                t  = M[:3, 3]
+                # 顶点：v' = R v + t
+                tris = np.einsum('ij,nkj->nki', Rm, tris) + t
+                # 法线：n' = R n（不含尺度；简单起见忽略非均匀缩放的影响）
+                if norms is not None:
+                    if norms.ndim == 2:   # (N,3) 面法线
+                        norms = norms @ Rm.T
+                    elif norms.ndim == 3: # (N,3,3) 顶点法线
+                        norms = np.einsum('ij,nkj->nki', Rm, norms)
+
+            color = inst.get("color", [0.8,0.8,0.8,1.0])
+
+            self.loaded_meshes.append({
+                "path": path,
+                "triangles": tris.astype(np.float32),
+                "normals": None if norms is None else norms.astype(np.float32),
+                "color": color,
+            })
+
+        self.update()
+
+
+    
+    
+    
+    def apply_gsply_transform(self, t_tuple, q_tuple, scale=1.0):
+        """使用 gsply_edit.py 对当前背景 PLY 做平移/旋转/缩放并就地覆盖 (-o 同一路径)。"""
         # 1) 当前背景名（只传文件名的约定）
         if self.full_filename is None:
             print("[GS-Edit] 当前未设置 background PLY；忽略。")
@@ -2660,59 +3040,85 @@ class OpenGLView(QOpenGLWidget):
             print("[GS-Edit] 当前未设置 background PLY；忽略。")
             return
 
+        # 在修改前先生成一份备份，保障可撤销
+        backup_path = self._create_gs_backup(cur_name)
+
         # 2) 拼出绝对路径（就地覆盖）
         in_path  = cur_name
         out_path = in_path
 
-        # 3) 组命令（-t/-r/-s=1），执行
+        # 3) 组命令（-t/-r/-s），执行
         tx,ty,tz = map(float, t_tuple)
         qx,qy,qz,qw = map(float, q_tuple)
         # 若四元数全 0，则视为单位
         if abs(qx)+abs(qy)+abs(qz)+abs(qw) < 1e-12:
             qx,qy,qz,qw = 0.0,0.0,0.0,1.0
+        scale = float(scale) if scale is not None else 1.0
 
         cmd = [
             "python", str(GSP_EDIT), str(in_path),
             "-t", str(tx), str(ty), str(tz),
             "-r", str(qx), str(qy), str(qz), str(qw),
-            "-s", "1",
+            "-s", str(scale),
             "-o", str(out_path)
         ]
         print("[GS-Edit] 运行：", " ".join(cmd))
-        subprocess.run(cmd, check=True)
+        try:
+            # 调用外部脚本写回PLY文件，实现对高斯点云的平移/旋转
+            subprocess.run(cmd, check=True)
+        except Exception as exc:
+            if backup_path and os.path.exists(backup_path):
+                try:
+                    # 写入失败时尝试恢复备份，避免破坏原文件
+                    shutil.copy2(backup_path, cur_name)
+                except Exception as restore_exc:
+                    print(f"[GS-Edit] 还原失败: {restore_exc}")
+            raise exc
 
-        # 4) 覆盖完成：重载同名 PLY（仍然只传文件名；GSRenderer 内部补路径）
-        self.set_gs_background(cur_name)
+        if backup_path and hasattr(self._scene_viewmodel, 'record_gs_edit'):
+            # 记录备份路径，供撤销栈恢复使用
+            self._scene_viewmodel.record_gs_edit(cur_name, backup_path)
+
+        # 4) 覆盖完成：重载所有 PLY 并保持当前选择
+        current_path = cur_name
+        all_paths = list(self.full_filenames)
+        # 重新加载所有 PLY，避免点云缓存滞后
+        self.set_gs_backgrounds(all_paths, sync_scene=False, reset_history=False)
+        # 此处仅恢复本地激活项，SceneViewModel 会在 set_gs_backgrounds 内部被动同步
+        self.set_active_gs_background_by_path(current_path)
+
+        # 如果控制视图模型维护撤销栈，通知其刷新
+        if hasattr(self._scene_viewmodel, 'control_viewmodel'):
+            self._scene_viewmodel.control_viewmodel._on_geometry_modified()
 
     def load_mesh(self, path: str) -> bool:
-        """
-        加载 .obj / .stl 模型为三角网格并保存到 self.loaded_meshes
-        只负责显示，不创建 Geometry，不支持选取/变换
-        """
-        ext = os.path.splitext(path)[1].lower()
+        """加载 OBJ/STL 模型并作为可编辑 mesh 几何体加入场景"""
         try:
-            if ext == ".obj":
-                tris, norms = self._load_obj(path)
-            elif ext == ".stl":
-                tris, norms = self._load_stl(path)
-            else:
-                print(f"[Mesh] 不支持的后缀: {ext}")
+            geometry = self._scene_viewmodel.create_mesh_from_path(path)
+            # SceneViewModel 会负责注册资产、生成初始位姿
+            if geometry is None:
                 return False
-
-            if tris is None or len(tris) == 0:
-                print("[Mesh] 没有三角形可以绘制")
-                return False
-
-            self.loaded_meshes.append({
-                "path": path,
-                "triangles": tris.astype(np.float32),
-                "normals": None if norms is None else norms.astype(np.float32),
-            })
+            self._scene_viewmodel.selected_geometry = geometry
+            # 自动选中刚导入的 mesh，便于立即调整属性
             self.update()
             return True
         except Exception as e:
             print(f"[Mesh] 加载失败: {e}")
             return False
+
+    def _create_gs_backup(self, path):
+        """为当前 PLY 生成带时间戳的备份文件，存放在 save/gs_backups 目录"""
+        try:
+            if not path or not os.path.exists(path):
+                return None
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            backup_name = f"{timestamp}_{os.path.basename(path)}"
+            backup_path = str(self._gs_backup_dir / backup_name)
+            shutil.copy2(path, backup_path)
+            return backup_path
+        except Exception as e:
+            print(f"[GS-Edit] 备份失败: {e}")
+            return None
 
     def _draw_loaded_meshes(self):
         """把 self.loaded_meshes 里的三角网格画出来"""
@@ -2720,9 +3126,12 @@ class OpenGLView(QOpenGLWidget):
             return
 
         # 可按需设置统一颜色（后续可做材质/颜色）
-        glColor4f(0.8, 0.8, 0.8, 1.0)
+        # glColor4f(0.8, 0.8, 0.8, 1.0)
 
         for mesh in self.loaded_meshes:
+            # 每条记录携带原始文件路径、三角面与法线，直接以立即模式绘制
+            col = mesh.get("color", (0.8,0.8,0.8,1.0))
+            glColor4f(float(col[0]), float(col[1]), float(col[2]), float(col[3]))
             tris = mesh["triangles"]              # (N, 3, 3)
             norms = mesh.get("normals", None)     # (N, 3, 3) 或 (N, 3) 或 None
 
@@ -2754,197 +3163,6 @@ class OpenGLView(QOpenGLWidget):
                             glVertex3f(float(v[0]), float(v[1]), float(v[2]))
             glEnd()
 
-    def _load_obj(self, path: str):
-        """
-        朴素 OBJ 解析（仅 v/vn/f；忽略 vt/mtl/材质/纹理）
-        返回:
-            triangles: (N,3,3) 顶点坐标
-            normals:   (N,3,3) 顶点法线（若文件不含 vn，则返回 None）
-        """
-        vs = []
-        vns = []
-        triangles = []
-        tri_normals = []   # 按顶点法线展开
-
-        def parse_f_token(tok):
-            # 形如 "v", "v/vt", "v//vn", "v/vt/vn"
-            parts = tok.split("/")
-            vi  = int(parts[0]) if parts[0] else 0
-            vti = int(parts[1]) if len(parts) > 1 and parts[1] else 0
-            vni = int(parts[2]) if len(parts) > 2 and parts[2] else 0
-            return vi, vti, vni
-
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("v "):
-                    _, x, y, z = line.split()[:4]
-                    vs.append([float(x), float(y), float(z)])
-                elif line.startswith("vn "):
-                    _, x, y, z = line.split()[:4]
-                    vns.append([float(x), float(y), float(z)])
-                elif line.startswith("f "):
-                    tokens = line.split()[1:]
-                    # 多边形用扇形剖分：v0, v(i-1), v(i)
-                    if len(tokens) < 3:
-                        continue
-                    # 转成索引三元组
-                    fvs = [parse_f_token(t) for t in tokens]
-                    for i in range(1, len(fvs) - 1):
-                        tri_idx = [fvs[0], fvs[i], fvs[i+1]]
-                        tri_v  = []
-                        tri_vn = []
-                        for (vi, _, vni) in tri_idx:
-                            # OBJ 索引可为负（从末尾数），这里做一下换算
-                            vi = vi - 1 if vi > 0 else len(vs) + vi
-                            tri_v.append(vs[vi])
-                            if vni != 0:
-                                vni = vni - 1 if vni > 0 else len(vns) + vni
-                                tri_vn.append(vns[vni])
-                        triangles.append(tri_v)
-                        tri_normals.append(tri_vn if len(tri_vn) == 3 else None)
-
-        triangles = np.asarray(triangles, dtype=np.float32)  # (N,3,3)
-        # 如果所有三角形都没有 vn，则返回 None；否则把缺失的补面法线
-        if len(tri_normals) == 0 or all(vn is None for vn in tri_normals):
-            normals = None
-        else:
-            normals = []
-            for tri, vn in zip(triangles, tri_normals):
-                if vn is None:
-                    # 用面法线填充
-                    v0, v1, v2 = tri
-                    n = np.cross(v1 - v0, v2 - v0)
-                    ln = np.linalg.norm(n) + 1e-12
-                    n = (n / ln).tolist()
-                    normals.append([n, n, n])
-                else:
-                    normals.append(vn)
-            normals = np.asarray(normals, dtype=np.float32)  # (N,3,3)
-        return triangles, normals
-
-    def _load_stl(self, path: str):
-        """
-        解析 STL（支持二进制与 ASCII），仅三角面+可选法线
-        返回:
-            triangles: (N,3,3)
-            normals:   (N,3) 面法线（若无则 None）
-        """
-        with open(path, "rb") as fb:
-            header = fb.read(80)
-            # 粗略判断：如果头80字节后跟着可解析的面数，基本是二进制
-            try:
-                tri_count = struct.unpack("<I", fb.read(4))[0]
-                # 进一步 sanity check：文件长度是否匹配预期
-                expected_len = 80 + 4 + tri_count * 50  # 每面 50 字节
-                fb.seek(0, os.SEEK_END)
-                actual_len = fb.tell()
-                if actual_len == expected_len:
-                    # 二进制 STL
-                    fb.seek(84)
-                    tris = []
-                    norms = []
-                    for _ in range(tri_count):
-                        n = struct.unpack("<fff", fb.read(12))
-                        v0 = struct.unpack("<fff", fb.read(12))
-                        v1 = struct.unpack("<fff", fb.read(12))
-                        v2 = struct.unpack("<fff", fb.read(12))
-                        fb.read(2)  # attribute byte count
-                        tris.append([v0, v1, v2])
-                        norms.append(n)
-                    triangles = np.asarray(tris, dtype=np.float32)
-                    normals   = np.asarray(norms, dtype=np.float32)  # (N,3)
-                    return triangles, normals
-            except Exception:
-                pass  # 不是标准的二进制头，按 ASCII 再尝试
-
-        # ASCII STL 解析 —— 用下面整段替换你原来的 ASCII 分支（含末尾 reshape 与 return）
-        tris_accum   = []   # 最终的三角形列表: [ [v0,v1,v2], ... ]
-        norms_accum  = []   # 每面的法线列表:   [ (nx,ny,nz), ... ]
-        all_vertices = []   # 仅用于回退：顺序收集所有 vertex
-        cur_vertices = []   # 当前 facet 的临时顶点
-        cur_normal   = None # 当前 facet 的法线（可能不存在）
-
-        def _compute_normal(v0, v1, v2):
-            v0 = np.asarray(v0, dtype=np.float64)
-            v1 = np.asarray(v1, dtype=np.float64)
-            v2 = np.asarray(v2, dtype=np.float64)
-            n  = np.cross(v1 - v0, v2 - v0)
-            ln = float(np.linalg.norm(n))
-            if ln == 0.0:
-                return (0.0, 0.0, 1.0)
-            return (float(n[0]/ln), float(n[1]/ln), float(n[2]/ln))
-
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
-                    continue
-                ls = s.lower()
-
-                # facet normal nx ny nz
-                if ls.startswith("facet normal"):
-                    parts = s.split()
-                    cur_normal = None
-                    if len(parts) >= 5:
-                        try:
-                            cur_normal = (float(parts[2]), float(parts[3]), float(parts[4]))
-                        except Exception:
-                            cur_normal = None
-                    cur_vertices = []  # 新 facet 开始，清空临时点
-
-                # vertex x y z
-                elif ls.startswith("vertex"):
-                    parts = s.split()
-                    if len(parts) >= 4:
-                        try:
-                            x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-                            cur_vertices.append([x, y, z])
-                            all_vertices.append([x, y, z])
-                        except Exception:
-                            pass
-
-                # endfacet: 将当前 facet 的顶点做三角化并收集
-                elif ls.startswith("endfacet"):
-                    if len(cur_vertices) >= 3:
-                        # STL 规范每个 facet 恰好3点；若>3，做扇形三角化
-                        v0 = cur_vertices[0]
-                        for i in range(1, len(cur_vertices) - 1):
-                            tri = [v0, cur_vertices[i], cur_vertices[i+1]]
-                            tris_accum.append(tri)
-                            n = cur_normal
-                            if (n is None) or (n == (0.0, 0.0, 0.0)):
-                                n = _compute_normal(tri[0], tri[1], tri[2])
-                            norms_accum.append(n)
-                    # 结束当前 facet
-                    cur_vertices = []
-                    cur_normal   = None
-
-                # 其他行 (solid/outer loop/endloop/endsolid...) 忽略
-                else:
-                    continue
-
-        # 规范 ASCII：应当已收集到三角与法线
-        if len(tris_accum) > 0:
-            tris  = np.asarray(tris_accum,  dtype=np.float32)
-            # 若法线数量异常，则在渲染阶段用叉积补法线
-            norms = np.asarray(norms_accum, dtype=np.float32) if len(norms_accum) == len(tris_accum) else None
-            return tris, norms
-
-        # 回退：没有 facet/endfacet，但有顶点；按“每 3 点一面”粗切
-        if len(all_vertices) >= 3:
-            usable = (len(all_vertices) // 3) * 3
-            tris = np.asarray(all_vertices[:usable], dtype=np.float32).reshape(-1, 3, 3)
-            norms = None
-            return tris, norms
-
-        # 仍然失败
-        return None, None
-
-        # # ASCII STL 解析
-        # triangles = []
         # normals = []
         # cur_n = None
         # with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -2974,3 +3192,4 @@ class OpenGLView(QOpenGLWidget):
         #     norms = np.asarray(normals, dtype=np.float32)  # (N,3)
         # return tris, norms
 
+        

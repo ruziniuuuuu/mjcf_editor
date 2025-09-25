@@ -24,6 +24,8 @@ class GeometryType(Enum):
     PLANE = "plane"
     ELLIPSOID = "ellipsoid"
     TRIANGLE = "triangle"
+    MESH = "mesh"
+    JOINT = "joint"
 
 
 class Material:
@@ -80,9 +82,22 @@ class BaseGeometry:
             GeometryType.PLANE.value: (0.7, 0.7, 0.7, 1.0),   # 灰色
             GeometryType.ELLIPSOID.value: (0.8, 0.2, 0.2, 1.0),  # 红色
             GeometryType.TRIANGLE.value: (0.2, 0.8, 0.8, 1.0),  # 青色
+            GeometryType.MESH.value: (0.8, 0.8, 0.8, 1.0),  # 默认灰
+            GeometryType.JOINT.value: (1.0, 0.9, 0.2, 1.0),  # 黄色
         }
         self.material.color = type_colors.get(geo_type, (1.0, 1.0, 1.0, 1.0))
-        
+
+        if geo_type == GeometryType.JOINT.value:
+            if not hasattr(self, "joint_axis"):
+                self.joint_axis = [1.0, 0.0, 0.0]
+            if not hasattr(self, "joint_length"):
+                base_half = float(self._size[0]) if self._size.size > 0 else 0.5
+                self.joint_length = max(base_half * 2.0, 1e-5)
+            if not hasattr(self, "joint_type"):
+                self.joint_type = "hinge"
+            if not hasattr(self, "joint_attrs") or not isinstance(getattr(self, "joint_attrs"), dict):
+                self.joint_attrs = {}
+
         self._update_transform()
         self._update_aabb()
     
@@ -119,7 +134,10 @@ class BaseGeometry:
         self._size = np.array(value)
         self._update_transform()
         self._update_aabb()
-    
+        if getattr(self, "type", None) == GeometryType.JOINT.value:
+            half_len = float(self._size[0]) if self._size.size > 0 else 0.5
+            self.joint_length = max(half_len * 2.0, 1e-5)
+
     @property
     def rotation(self):
         """获取旋转角度"""
@@ -131,6 +149,18 @@ class BaseGeometry:
         self._rotation = np.array(value, dtype=np.float32)
         self._update_transform()
         self._update_aabb()
+        if getattr(self, "type", None) == GeometryType.JOINT.value:
+            rot = R.from_euler('XYZ', self._rotation, degrees=True)
+            axis = rot.apply([1.0, 0.0, 0.0])
+            norm = float(np.linalg.norm(axis))
+            if norm < 1e-6:
+                axis = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                norm = 1.0
+            axis = (axis / norm).astype(np.float32)
+            self.joint_axis = axis.tolist()
+            if not hasattr(self, "joint_attrs") or not isinstance(getattr(self, "joint_attrs"), dict):
+                self.joint_attrs = {}
+            self.joint_attrs['axis'] = " ".join(f"{float(a):g}" for a in axis)
     
     @property
     def aabb_bounds(self):
@@ -234,7 +264,6 @@ class GeometryGroup(BaseGeometry):
     def __init__(self, name="Group", position=(0, 0, 0), rotation=(0, 0, 0), parent=None):
         super().__init__(None, name, position, (1, 1, 1), rotation, parent)
         self.type = "group"  # 特殊类型
-        self.joints = []
     
     @property
     def size(self):

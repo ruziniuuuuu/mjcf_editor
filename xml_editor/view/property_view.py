@@ -4,9 +4,9 @@
 负责显示和编辑选中对象的属性。
 """
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QFormLayout, QLabel, 
-                            QLineEdit, QDoubleSpinBox, QComboBox, QColorDialog,
-                            QPushButton, QHBoxLayout, QGroupBox, QCheckBox)
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QFormLayout, QLabel,
+                             QLineEdit, QDoubleSpinBox, QComboBox, QColorDialog,
+                             QPushButton, QHBoxLayout, QGroupBox, QCheckBox)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 
@@ -16,7 +16,6 @@ from ..model.geometry import GeometryType, Material
 
 class SmartDecimalsSpinBox(QDoubleSpinBox):
     """
-    LZQ:0902
     • 显示策略：未编辑时按 pretty_decimals 固定小数位显示（例如 3 位）
                编辑中显示全精度（不强制补 0、不四舍五入打断输入）
     • 数值精度：内部 setDecimals 给一个很高的上限（比如 15），不截断输入
@@ -97,23 +96,23 @@ class PropertyView(QWidget):
         self._form_layout = QFormLayout()
         self._form_layout.setContentsMargins(2, 2, 2, 2)
         self._form_layout.setSpacing(6)
-        
+
         # 包含所有属性的容器（方便动态更新）
         self._container = QWidget()
         self._container.setLayout(self._form_layout)
-        
+
         # 设置初始宽度
-        self.setMinimumWidth(200)
-        
+        self.setMinimumWidth(220)
+
         main_layout.addWidget(self._container)
-        
-        # 默认情况下隐藏属性编辑区域
         self._container.setVisible(False)
         
         # 创建各种属性分组
         self._create_transform_group()
         self._create_geometry_group()
         self._create_material_group()
+        self._create_physics_group()
+        self._create_joint_group()
     
     def _create_transform_group(self):
         """创建变换属性组"""
@@ -198,6 +197,19 @@ class PropertyView(QWidget):
         self._hide_all_size_controls()
         
         transform_layout.addWidget(self._size_group)
+
+        # mesh 资产缩放
+        self._mesh_scale_group = QGroupBox("Mesh 缩放")
+        mesh_scale_layout = QFormLayout(self._mesh_scale_group)
+        # 该分组单独控制 MJCF mesh 的资产缩放（三轴独立），默认隐藏，选中 mesh 时再显示
+        self._mesh_scale_x = self._create_double_spinbox("mesh_scale_x", 1e-6, 1000.0, 0.001)
+        self._mesh_scale_y = self._create_double_spinbox("mesh_scale_y", 1e-6, 1000.0, 0.001)
+        self._mesh_scale_z = self._create_double_spinbox("mesh_scale_z", 1e-6, 1000.0, 0.001)
+        mesh_scale_layout.addRow("X:", self._mesh_scale_x)
+        mesh_scale_layout.addRow("Y:", self._mesh_scale_y)
+        mesh_scale_layout.addRow("Z:", self._mesh_scale_z)
+        self._mesh_scale_group.hide()
+        transform_layout.addWidget(self._mesh_scale_group)
         self._form_layout.addRow(transform_group)
         
         # 保留原来的缩放控件，但隐藏它们，用于兼容后端逻辑
@@ -235,6 +247,8 @@ class PropertyView(QWidget):
         self._ellipsoid_x_label.hide()
         self._ellipsoid_y_label.hide()
         self._ellipsoid_z_label.hide()
+        if hasattr(self, '_mesh_scale_group') and self._mesh_scale_group is not None:
+            self._mesh_scale_group.hide()
     
     def _show_size_controls_for_type(self, geo_type):
         """根据几何体类型显示相应的尺寸控件"""
@@ -270,6 +284,8 @@ class PropertyView(QWidget):
             self._size_group.setTitle("尺寸")
         elif geo_type == "plane":
             self._size_group.setTitle("尺寸 (不可调整)")
+        elif geo_type == "joint":
+            self._size_group.setTitle("尺寸 (由关节长度控制)")
     
     def _handle_sphere_radius_change(self, value):
         """处理球体半径变化"""
@@ -383,10 +399,63 @@ class PropertyView(QWidget):
         material_layout.addRow("透明度:", self._opacity)
         
         self._form_layout.addRow(material_group)
+
+    def _create_physics_group(self):
+        """创建物理属性组"""
+        self._physics_group = QGroupBox("物理属性")
+        self._physics_layout = QFormLayout(self._physics_group)
+        self._physics_editors = {}
+
+        for key in self._property_viewmodel.PHYSICS_ATTRS:
+            editor = QLineEdit()
+            editor.setPlaceholderText("输入或留空删除")
+            editor.editingFinished.connect(lambda k=key, e=editor: self.propertyChanged.emit(f"physics_attr_{k}", e.text().strip()))
+            self._physics_layout.addRow(f"{key}:", editor)
+            label = self._physics_layout.labelForField(editor)
+            if label:
+                label.hide()
+            editor.hide()
+            self._physics_editors[key] = editor
+
+        self._physics_group.hide()
+        self._form_layout.addRow(self._physics_group)
+
+    def _create_joint_group(self):
+        """创建关节属性组"""
+        self._joint_group = QGroupBox("关节")
+        joint_layout = QFormLayout(self._joint_group)
+
+        self._joint_type_combo = QComboBox()
+        self._joint_type_combo.addItem("Hinge (铰链)", "hinge")
+        self._joint_type_combo.addItem("Slide (滑动)", "slide")
+        self._joint_type_combo.currentIndexChanged.connect(
+            lambda idx: self.propertyChanged.emit("joint_type", self._joint_type_combo.itemData(idx))
+        )
+        joint_layout.addRow("类型:", self._joint_type_combo)
+
+        self._joint_axis_x = self._create_double_spinbox("joint_axis_x", -1.0, 1.0, 0.05)
+        self._joint_axis_y = self._create_double_spinbox("joint_axis_y", -1.0, 1.0, 0.05)
+        self._joint_axis_z = self._create_double_spinbox("joint_axis_z", -1.0, 1.0, 0.05)
+        joint_layout.addRow("轴 X:", self._joint_axis_x)
+        joint_layout.addRow("轴 Y:", self._joint_axis_y)
+        joint_layout.addRow("轴 Z:", self._joint_axis_z)
+
+        self._joint_length = self._create_double_spinbox("joint_length", 0.01, 100.0, 0.05)
+        joint_layout.addRow("长度:", self._joint_length)
+
+        self._joint_attr_editors = {}
+        for key in self._property_viewmodel.JOINT_EXTRA_ATTRS:
+            editor = QLineEdit()
+            editor.setPlaceholderText("输入或留空删除")
+            editor.editingFinished.connect(lambda k=key, e=editor: self.propertyChanged.emit(f"joint_attr_{k}", e.text().strip()))
+            joint_layout.addRow(f"{key}:", editor)
+            self._joint_attr_editors[key] = editor
+
+        self._joint_group.hide()
+        self._form_layout.addRow(self._joint_group)
     
     def _create_double_spinbox(self, property_name, min_val=-1000.0, max_val=1000.0, step=1.0, max_decimals=15):
         """
-        LZQ:0902
         修改三位小数输入问题, 最大15位double型数字输入框
         创建双精度数字输入框
         
@@ -400,6 +469,7 @@ class PropertyView(QWidget):
         sb = SmartDecimalsSpinBox(max_decimals=max_decimals, parent=self)
         sb.setRange(min_val, max_val)
         sb.setSingleStep(step)
+        # 直接把 SpinBox 的实时数值广播给视图模型，保持 UI 与数据层同步
         sb.valueChanged.connect(
             lambda value: self.propertyChanged.emit(property_name, value)
         )
@@ -517,7 +587,97 @@ class PropertyView(QWidget):
             
             # 根据几何体类型显示对应的尺寸控件
             self._show_size_controls_for_type(geo_type)
-        
+
+        # 更新 mesh 缩放控件
+        if geo_type == GeometryType.MESH.value:
+            if self._property_viewmodel.is_mesh_scale_editable():
+                mesh_scale = self._property_viewmodel.get_property("mesh_scale")
+                # 属性可编辑时，把资产缩放值同步到三个 SpinBox
+                if mesh_scale is not None and len(mesh_scale) == 3:
+                    self._mesh_scale_group.show()
+                    self._mesh_scale_x.blockSignals(True)
+                    self._mesh_scale_y.blockSignals(True)
+                    self._mesh_scale_z.blockSignals(True)
+                    self._mesh_scale_x.setValue(mesh_scale[0])
+                    self._mesh_scale_y.setValue(mesh_scale[1])
+                    self._mesh_scale_z.setValue(mesh_scale[2])
+                    self._mesh_scale_x.blockSignals(False)
+                    self._mesh_scale_y.blockSignals(False)
+                    self._mesh_scale_z.blockSignals(False)
+                else:
+                    self._mesh_scale_group.hide()
+            else:
+                self._mesh_scale_group.hide()
+        else:
+            self._mesh_scale_group.hide()
+
+        # 更新物理属性
+        physics_attrs = self._property_viewmodel.get_physics_attributes()
+        has_physics = False
+        for key, editor in self._physics_editors.items():
+            label = self._physics_layout.labelForField(editor)
+            if key in physics_attrs:
+                has_physics = True
+                editor.blockSignals(True)
+                editor.setText(str(physics_attrs.get(key, "")))
+                editor.blockSignals(False)
+                editor.show()
+                if label:
+                    label.show()
+            else:
+                editor.blockSignals(True)
+                editor.clear()
+                editor.blockSignals(False)
+                editor.hide()
+                if label:
+                    label.hide()
+
+        self._physics_group.setVisible(has_physics)
+
+        # 更新关节属性
+        is_joint = (geo_type == GeometryType.JOINT.value)
+        self._joint_group.setVisible(is_joint)
+        if is_joint:
+            joint_type = self._property_viewmodel.get_property("joint_type")
+            if joint_type is None:
+                joint_type = "hinge"
+            self._joint_type_combo.blockSignals(True)
+            idx = self._joint_type_combo.findData(joint_type)
+            self._joint_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self._joint_type_combo.blockSignals(False)
+
+            axis = self._property_viewmodel.get_property("joint_axis") or [1.0, 0.0, 0.0]
+            if len(axis) < 3:
+                axis = list(axis) + [0.0] * (3 - len(axis))
+            self._joint_axis_x.blockSignals(True)
+            self._joint_axis_y.blockSignals(True)
+            self._joint_axis_z.blockSignals(True)
+            self._joint_axis_x.setValue(axis[0])
+            self._joint_axis_y.setValue(axis[1])
+            self._joint_axis_z.setValue(axis[2])
+            self._joint_axis_x.blockSignals(False)
+            self._joint_axis_y.blockSignals(False)
+            self._joint_axis_z.blockSignals(False)
+
+            joint_length = self._property_viewmodel.get_property("joint_length")
+            if joint_length is None:
+                joint_length = 0.3
+            self._joint_length.blockSignals(True)
+            self._joint_length.setValue(joint_length)
+            self._joint_length.blockSignals(False)
+
+            joint_attrs = self._property_viewmodel.get_joint_attributes()
+            for key, editor in self._joint_attr_editors.items():
+                text = joint_attrs.get(key, "")
+                editor.blockSignals(True)
+                editor.setText(text)
+                editor.blockSignals(False)
+        else:
+            for editor in self._joint_attr_editors.values():
+                editor.blockSignals(True)
+                editor.clear()
+                editor.blockSignals(False)
+
         # 更新缩放/尺寸值
         scale = self._property_viewmodel.get_property("scale")
         if scale is not None:

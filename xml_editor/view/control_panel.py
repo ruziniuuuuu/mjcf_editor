@@ -13,6 +13,8 @@ from PyQt5.QtGui import QDrag, QPixmap, QIcon
 from .property_view import SmartDecimalsSpinBox
 
 import os
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from ..model.geometry import OperationMode, GeometryType
 
@@ -23,8 +25,9 @@ class ControlPanel(QWidget):
     提供场景操作控制界面，包括几何体创建和变换模式选择等
     """
     
-    # ( (tx,ty,tz), (qx,qy,qz,qw) )
-    applyGsEditRequested = pyqtSignal(tuple, tuple)
+    # (平移, 四元数, 缩放) -> 交给 OpenGL 视图调用 gsply_edit.py
+    applyGsEditRequested = pyqtSignal(tuple, tuple, float)
+    gsPlySelectionChanged = pyqtSignal(str)
     
     def __init__(self, control_viewmodel, parent=None):
         """
@@ -63,7 +66,7 @@ class ControlPanel(QWidget):
         
         # 底部填充空间
         main_layout.addStretch()
-        #LZQ：0904
+
         #新增坐标系的大小调整
         gizmo_group = QGroupBox("坐标系 (Gizmo)")
         gizmo_layout = QHBoxLayout(gizmo_group)
@@ -78,22 +81,26 @@ class ControlPanel(QWidget):
         #新增ply的修改：
         gs_group = QGroupBox("GS PLY 编辑")
         gs_form = QFormLayout(gs_group)
-        # 平移 t
-        self.tx = QDoubleSpinBox(); self.tx.setRange(-1000, 1000); self.tx.setDecimals(4); self.tx.setSingleStep(0.01)
-        self.ty = QDoubleSpinBox(); self.ty.setRange(-1000, 1000); self.ty.setDecimals(4); self.ty.setSingleStep(0.01)
-        self.tz = QDoubleSpinBox(); self.tz.setRange(-1000, 1000); self.tz.setDecimals(4); self.tz.setSingleStep(0.01)
+        self.gs_file_combo = QComboBox()
+        self.gs_file_combo.currentIndexChanged.connect(self._on_gs_combo_changed)
+        gs_form.addRow("当前 PLY", self.gs_file_combo)
+        # 平移 t（x, y, z）
+        self.tx = self._make_smart_spin(-1000.0, 1000.0, 0.01, init=0.0)
+        self.ty = self._make_smart_spin(-1000.0, 1000.0, 0.01, init=0.0)
+        self.tz = self._make_smart_spin(-1000.0, 1000.0, 0.01, init=0.0)
         row_t = QHBoxLayout(); row_t.addWidget(self.tx); row_t.addWidget(self.ty); row_t.addWidget(self.tz)
-        gs_form.addRow("平移 t (x,y,z)", row_t)
+        gs_form.addRow("平移 t (x, y, z)", row_t)
+        
+        # 旋转 (roll/pitch/yaw) 使用度
+        self.roll = self._make_smart_spin(-360.0, 360.0, 0.01, init=0.0)
+        self.pitch = self._make_smart_spin(-360.0, 360.0, 0.01, init=0.0)
+        self.yaw = self._make_smart_spin(-360.0, 360.0, 0.01, init=0.0)
+        row_r = QHBoxLayout(); row_r.addWidget(self.roll); row_r.addWidget(self.pitch); row_r.addWidget(self.yaw)
+        gs_form.addRow("旋转 R/P/Y (°)", row_r)
 
-        # 旋转 r（四元数 xyzw；无旋转：0,0,0,1）
-        self.qx = QDoubleSpinBox(); self.qx.setRange(-1, 1); self.qx.setDecimals(4); self.qx.setSingleStep(0.001)
-        self.qy = QDoubleSpinBox(); self.qy.setRange(-1, 1); self.qy.setDecimals(4); self.qy.setSingleStep(0.001)
-        self.qz = QDoubleSpinBox(); self.qz.setRange(-1, 1); self.qz.setDecimals(4); self.qz.setSingleStep(0.001)
-        self.qw = QDoubleSpinBox(); self.qw.setRange(-1, 1); self.qw.setDecimals(4); self.qw.setSingleStep(0.001); self.qw.setValue(1.0)
-        row_q1 = QHBoxLayout(); row_q1.addWidget(self.qx); row_q1.addWidget(self.qy)
-        row_q2 = QHBoxLayout(); row_q2.addWidget(self.qz); row_q2.addWidget(self.qw)
-        gs_form.addRow("q (x,y)", row_q1)
-        gs_form.addRow("q (z,w)", row_q2)
+        # 缩放 scale（默认 1.0）
+        self.gs_scale = self._make_smart_spin(0.01, 1000.0, 0.01, init=1.0)
+        gs_form.addRow("缩放 scale", self.gs_scale)
         # 按钮：仅点击时才执行“修改并重载”
         btn_apply = QPushButton("加载修改参数")
         btn_reset = QPushButton("重置单位")
@@ -101,7 +108,7 @@ class ControlPanel(QWidget):
         btn_reset.clicked.connect(self._reset_fields)
         row_btn = QHBoxLayout(); row_btn.addWidget(btn_apply); row_btn.addWidget(btn_reset)
         gs_form.addRow(row_btn)
-        # self.layout().addWidget(gs_group)   # 把这个分组加到主布局中
+        self.layout().addWidget(gs_group)   # 把这个分组加到主布局中
         
         # 添加存档相关的按钮组
         save_group = QGroupBox("存档管理")
@@ -125,6 +132,65 @@ class ControlPanel(QWidget):
         # 连接视图模型的信号
         self._control_viewmodel.saveStateCompleted.connect(self.on_save_completed)
         self._control_viewmodel.loadStateCompleted.connect(self.on_load_completed)
+
+    def set_gs_ply_entries(self, entries, emit_change=True):
+        """更新可选的 PLY 列表
+
+        参数:
+            entries: list[(display_key, absolute_path)]
+        """
+        current_key = self.gs_file_combo.currentData()
+        self.gs_file_combo.blockSignals(True)
+        # 暂停信号触发，确保刷新条目时不会意外通知监听方
+        self.gs_file_combo.clear()
+        target_index = -1
+        for key, path in entries:
+            if not key:
+                continue
+            display = key
+            if path:
+                display = f"{key} ({os.path.basename(path)})"
+            self.gs_file_combo.addItem(display, key)
+            if target_index == -1 and current_key and key == current_key:
+                target_index = self.gs_file_combo.count() - 1
+
+        self.gs_file_combo.blockSignals(False)
+        if self.gs_file_combo.count() > 0:
+            if target_index == -1:
+                target_index = 0
+            self.gs_file_combo.setCurrentIndex(target_index)
+            selected_key = self.gs_file_combo.itemData(target_index)
+            if emit_change:
+                if current_key == selected_key:
+                    # 在刷新后仍保持原选择时，手动发射一次信号同步状态
+                    self.gsPlySelectionChanged.emit(selected_key)
+            else:
+                # 不触发信号，由调用方决定是否通知
+                pass
+
+    def select_gs_key(self, key, emit=True):
+        if key is None:
+            return
+        index = self.gs_file_combo.findData(key)
+        if index < 0:
+            return
+        if index == self.gs_file_combo.currentIndex():
+            if emit:
+                # 主动补发信号，保证上层逻辑能感知到用户选择同一项的情况
+                self.gsPlySelectionChanged.emit(key)
+            return
+        self.gs_file_combo.blockSignals(not emit)
+        self.gs_file_combo.setCurrentIndex(index)
+        self.gs_file_combo.blockSignals(False)
+        if emit:
+            self.gsPlySelectionChanged.emit(key)
+
+    def _on_gs_combo_changed(self, index):
+        key = self.gs_file_combo.itemData(index)
+        if key:
+            # 下拉框选择切换时通知外部更新当前高斯背景
+            self.gsPlySelectionChanged.emit(key)
+    
     
     def _create_operation_tools(self, parent_layout):
         """
@@ -164,6 +230,7 @@ class ControlPanel(QWidget):
         self._operation_button_group.addButton(self._translate_radio, OperationMode.TRANSLATE.value)
         self._operation_button_group.addButton(self._rotate_radio, OperationMode.ROTATE.value)
         self._operation_button_group.addButton(self._scale_radio, OperationMode.SCALE.value)
+        # 直接监听按钮对象，稍后通过 id() 取出 OperationMode 枚举值
         self._operation_button_group.buttonClicked.connect(self._on_operation_mode_changed)
         
         # 默认选中平移模式
@@ -186,39 +253,45 @@ class ControlPanel(QWidget):
         # 使用枚举的字符串值 - 第一行
         self._create_box_button = self._create_draggable_button("立方体", GeometryType.BOX.value, geometry_layout, 0, 0)
         self._create_sphere_button = self._create_draggable_button("球体", GeometryType.SPHERE.value, geometry_layout, 0, 1)
-        
+
         # 第二行
         self._create_cylinder_button = self._create_draggable_button("圆柱", GeometryType.CYLINDER.value, geometry_layout, 1, 0)
         self._create_plane_button = self._create_draggable_button("平面", GeometryType.PLANE.value, geometry_layout, 1, 1)
-        
+
         # 第三行 - 添加胶囊体和椭球体按钮
         self._create_capsule_button = self._create_draggable_button("胶囊体", GeometryType.CAPSULE.value, geometry_layout, 2, 0)
         self._create_ellipsoid_button = self._create_draggable_button("椭球体", GeometryType.ELLIPSOID.value, geometry_layout, 2, 1)
-        
+
+        # 第四行 - 铰链与滑动关节
+        self._create_hinge_joint_button = self._create_draggable_button("关节·铰链", GeometryType.JOINT.value, geometry_layout, 3, 0, variant="hinge")
+        self._create_slide_joint_button = self._create_draggable_button("关节·滑动", GeometryType.JOINT.value, geometry_layout, 3, 1, variant="slide")
+
         # 添加提示标签
         hint_label = QLabel("提示：拖拽几何体到场景中创建")
         hint_label.setAlignment(Qt.AlignCenter)
-        geometry_layout.addWidget(hint_label, 3, 0, 1, 2)
-        
+        geometry_layout.addWidget(hint_label, 4, 0, 1, 2)
+
         parent_layout.addWidget(geometry_group)
-    
-    def _create_draggable_button(self, text, geo_type_value, layout, row, col):
+
+    def _create_draggable_button(self, text, geo_type_value, layout, row, col, variant=None):
         """
         创建可拖拽的几何体按钮
-        
+
         参数:
             text: 按钮文本
             geo_type_value: 几何体类型值
             layout: 父布局
             row: 行位置
             col: 列位置
+            variant: 附加标记，例如不同的 joint 类型
             
         返回:
             创建的按钮
         """
         button = QPushButton(text)
-        button.setProperty("geo_type", geo_type_value)
-        print(f"创建按钮 '{text}' 的几何体类型: '{geo_type_value}'，类型: {type(geo_type_value)}")
+        payload = geo_type_value if variant is None else f"{geo_type_value}:{variant}"
+        button.setProperty("geo_type", payload)
+        print(f"创建按钮 '{text}' 的几何体类型: '{payload}'，类型: {type(payload)}")
         layout.addWidget(button, row, col)
         
         # 启用鼠标跟踪以实现拖拽
@@ -363,17 +436,27 @@ class ControlPanel(QWidget):
 
     def _emit_apply(self, checked: bool = False):
         t = (self.tx.value(), self.ty.value(), self.tz.value())
-        q = (self.qx.value(), self.qy.value(), self.qz.value(), self.qw.value())
-        # 若用户给了全 0 四元数，自动矫正为“无旋转”
-        if abs(q[0]) < 1e-12 and abs(q[1]) < 1e-12 and abs(q[2]) < 1e-12 and abs(q[3]) < 1e-12:
-            q = (0.0, 0.0, 0.0, 1.0)
-        self.applyGsEditRequested.emit(t, q)
+        euler = np.array([self.roll.value(), self.pitch.value(), self.yaw.value()], dtype=float)
+        quat = R.from_euler('xyz', np.deg2rad(euler)).as_quat()  # [x,y,z,w]
+        q = (float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3]))
+        s = float(self.gs_scale.value())
+        # 将界面中的平移/旋转/缩放参数打包成高斯 PLY 编辑命令
+        self.applyGsEditRequested.emit(t, q, s)
 
     def _reset_fields(self, checked: bool = False):
+        # 一键重置平移/旋转/缩放输入，方便回到原始状态
         self.tx.setValue(0.0); self.ty.setValue(0.0); self.tz.setValue(0.0)
-        self.qx.setValue(0.0); self.qy.setValue(0.0); self.qz.setValue(0.0); self.qw.setValue(1.0)
+        self.roll.setValue(0.0); self.pitch.setValue(0.0); self.yaw.setValue(0.0)
+        self.gs_scale.setValue(1.0)
 
-
+    def _make_smart_spin(self, vmin, vmax, step, init=None):
+        sp = SmartDecimalsSpinBox(max_decimals=15, parent=self)
+        sp.setRange(vmin, vmax)
+        sp.setSingleStep(step)
+        sp.setKeyboardTracking(False)  # 避免输入中间态就触发
+        if init is not None:
+            sp.setValue(init)
+        return sp
 class SavesDialog(QDialog):
     """最近存档对话框"""
     
@@ -477,4 +560,3 @@ class SavesDialog(QDialog):
                 QMessageBox.warning(self, "无效文件", "选择的存档文件路径无效")
         else:
             QMessageBox.information(self, "提示", "请先选择一个存档") 
-

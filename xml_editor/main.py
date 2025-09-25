@@ -15,6 +15,7 @@ from .viewmodel.scene_viewmodel import SceneViewModel
 from .viewmodel.property_viewmodel import PropertyViewModel
 from .viewmodel.hierarchy_viewmodel import HierarchyViewModel
 from .viewmodel.control_viewmodel import ControlViewModel
+from .model.xml_parser import XMLParser
 
 # 导入视图组件
 from .view.opengl_view import OpenGLView
@@ -57,6 +58,7 @@ class MainWindow(QMainWindow):
         self.control_panel.gizmoGlobalSpin.valueChanged.connect(
             lambda v: self.scene_viewmodel.set_global_gizmo_size_world(v)
         )
+        self.scene_viewmodel.gizmoSizeChanged.connect(self._on_gizmo_size_changed)
         
         # 设置中央窗口部件
         self.setCentralWidget(self.opengl_view)
@@ -72,9 +74,39 @@ class MainWindow(QMainWindow):
         
         # 记录当前打开的文件
         self.current_file = None
+        self.loaded_xml_files = []
 
-        #ply修改建立连接
+        # ply修改建立连接
+        # 控制面板发出的GS编辑、选择变化都要同步给OpenGL视图
+        # GS 编辑：UI -> OpenGL 视图，参数包含平移/旋转/缩放
         self.control_panel.applyGsEditRequested.connect(self.opengl_view.apply_gsply_transform)
+        self.control_panel.gsPlySelectionChanged.connect(self.opengl_view.set_active_gs_background)
+        # 初始化下拉框条目，与当前已加载的GS背景保持一致
+        self.control_panel.set_gs_ply_entries(self.opengl_view.get_gs_background_entries(), emit_change=False)
+        # 监听SceneViewModel，确保任何层的变动都能刷新界面
+        self.scene_viewmodel.gsBackgroundsChanged.connect(self._on_gs_backgrounds_changed)
+        self.scene_viewmodel.control_viewmodel = self.control_viewmodel
+
+    
+    def _on_gizmo_size_changed(self, value: float):
+        self.control_panel.gizmoGlobalSpin.blockSignals(True)
+        self.control_panel.gizmoGlobalSpin.setValue(value)
+        self.control_panel.gizmoGlobalSpin.blockSignals(False)
+
+    def _on_gs_backgrounds_changed(self, entries, active_key):
+        # 当场景层面更新高斯背景列表时，让渲染视图及时重载PLY，[(key, path), ...]
+        self.opengl_view.update_gs_backgrounds_from_scene(entries, active_key)
+        combo_entries = [(item.get('key'), item.get('path')) for item in entries]
+        # 将最新的高斯背景同步到控制面板的下拉列表
+        self.control_panel.set_gs_ply_entries(combo_entries, emit_change=False)
+        if active_key:
+            # 维持当前激活的背景选择，不触发额外信号
+            self.control_panel.select_gs_key(active_key, emit=False)
+        else:
+            # 无激活项时清空选中状态，同时避免产生多余的切换事件
+            self.control_panel.gs_file_combo.blockSignals(True)
+            self.control_panel.gs_file_combo.setCurrentIndex(-1)
+            self.control_panel.gs_file_combo.blockSignals(False)
 
     
     def _setup_dock_widgets(self):
@@ -221,39 +253,72 @@ class MainWindow(QMainWindow):
                 return
         
         # 清空当前场景
-        self.scene_viewmodel.geometries = []
+        self.scene_viewmodel.clear_scene()
         # 重置当前文件
         self.current_file = None
+        self.loaded_xml_files = []
         # 更新窗口标题
         self.setWindowTitle("MuJoCo场景编辑器")
         self.statusBar().showMessage("已创建新场景")
     
     def _open_file(self):
         """打开文件"""
-        filename, _ = QFileDialog.getOpenFileName(
+        filenames, _ = QFileDialog.getOpenFileNames(
             self, "打开场景", "", "XML文件 (*.xml);;所有文件 (*)"
         )
-        
-        if filename:
-            if self.scene_viewmodel.load_scene(filename):
-                # 记录当前打开的文件
-                self.current_file = filename
-                # 更新窗口标题以显示当前文件名
-                self.setWindowTitle(f"MuJoCo场景编辑器 - {os.path.basename(filename)}")
-                self.statusBar().showMessage(f"已加载场景: {os.path.basename(filename)}")
-            else:
-                QMessageBox.warning(self, "加载错误", "无法加载场景文件。")
-    
-    def _open_file_ply(self):
-        """打开ply文件"""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择PLY文件", "", "PLY 文件 (*.ply)"
-        )
-        if not path:
+
+        if not filenames:
             return
 
-        # filename = os.path.basename(path)
-        self.opengl_view.set_gs_background(path)
+        # 如果场景已有内容，提示是否替换
+        if len(self.scene_viewmodel.geometries) > 0:
+            reply = QMessageBox.question(
+                self, "打开场景",
+                "打开新的XML会清空当前场景。是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
+        self.scene_viewmodel.clear_scene()
+        self.opengl_view.clear_loaded_meshes()
+
+        loaded_paths = []
+        failed_paths = []
+        for index, path in enumerate(filenames):
+            ok = self.scene_viewmodel.load_scene(path, append=(index > 0))
+            if ok:
+                loaded_paths.append(os.path.abspath(path))
+            else:
+                failed_paths.append(path)
+
+        if loaded_paths:
+            self.loaded_xml_files = loaded_paths
+            if len(loaded_paths) == 1:
+                self.current_file = loaded_paths[0]
+                title_suffix = os.path.basename(loaded_paths[0])
+            else:
+                self.current_file = None
+                title_suffix = f"{len(loaded_paths)} 个文件"
+
+            self.setWindowTitle(f"MuJoCo场景编辑器 - {title_suffix}")
+            self.statusBar().showMessage(f"已加载 {len(loaded_paths)} 个XML")
+        else:
+            self.statusBar().showMessage("未加载任何XML")
+
+        if failed_paths:
+            QMessageBox.warning(self, "加载错误", "无法加载以下XML：\n" + "\n".join(failed_paths))
+    
+    def _open_file_ply(self):
+        """打开 ply 文件，可一次选择多个"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择 PLY 文件", "", "PLY 文件 (*.ply)"
+        )
+        if not paths:
+            return
+
+        self.opengl_view.set_gs_backgrounds(paths, reset_history=True)
+        self.statusBar().showMessage(f"已加载 {len(paths)} 个 PLY 文件")
 
     def _open_file_mesh(self):
         """打开 OBJ / STL 文件并让 OpenGL 视图显示"""
@@ -263,6 +328,7 @@ class MainWindow(QMainWindow):
             "",
             "3D模型 (*.obj *.stl);;OBJ 文件 (*.obj);;STL 文件 (*.stl)"
         )
+        # 仅加载单个网格作为临时可视化对象，不写入当前 XML 场景
         if not filename:
             return
 
@@ -274,15 +340,33 @@ class MainWindow(QMainWindow):
 
     def _save_file(self):
         """保存文件"""
-        # 如果已有当前文件，直接保存到该文件
-        if self.current_file:
-            if self.scene_viewmodel.save_scene(self.current_file):
-                self.statusBar().showMessage(f"已保存场景: {os.path.basename(self.current_file)}")
+        sources = self.scene_viewmodel.get_loaded_sources()
+        sources = [os.path.abspath(p) for p in sources]
+
+        if len(sources) <= 1:
+            target = self.current_file or (sources[0] if sources else None)
+            if target:
+                if self.scene_viewmodel.save_scene(target):
+                    self.statusBar().showMessage(f"已保存场景: {os.path.basename(target)}")
+                else:
+                    QMessageBox.warning(self, "保存错误", "无法保存场景文件。")
             else:
-                QMessageBox.warning(self, "保存错误", "无法保存场景文件。")
+                # 如果没有当前文件，则调用另存为
+                self._save_file_as()
+            return
+
+        if self.scene_viewmodel.has_unsourced_geometry():
+            QMessageBox.information(
+                self,
+                "提示",
+                "存在未关联来源的几何体，请使用“另存为”导出它们。"
+            )
+
+        failures = self.scene_viewmodel.save_loaded_sources()
+        if failures:
+            QMessageBox.warning(self, "保存错误", "以下XML保存失败：\n" + "\n".join(failures))
         else:
-            # 如果没有当前文件，则调用另存为
-            self._save_file_as()
+            self.statusBar().showMessage(f"已保存 {len(sources)} 个XML")
     
     def _save_file_as(self):
         """另存为"""
@@ -294,12 +378,23 @@ class MainWindow(QMainWindow):
             if not filename.lower().endswith(('.xml')):
                 filename += '.xml'
                 
-            if self.scene_viewmodel.save_scene(filename):
+            export_unsourced_only = self.scene_viewmodel.has_unsourced_geometry()
+            if self.scene_viewmodel.save_scene(filename, include_unsourced_only=export_unsourced_only):
                 # 更新当前文件
                 self.current_file = filename
+                abs_path = os.path.abspath(filename)
+                if abs_path not in self.loaded_xml_files:
+                    self.loaded_xml_files.append(abs_path)
                 # 更新窗口标题
                 self.setWindowTitle(f"MuJoCo场景编辑器 - {os.path.basename(filename)}")
                 self.statusBar().showMessage(f"已保存场景: {os.path.basename(filename)}")
+
+                if export_unsourced_only:
+                    failures = self.scene_viewmodel.save_loaded_sources()
+                    if failures:
+                        QMessageBox.warning(self, "保存错误", "以下XML保存失败：\n" + "\n".join(failures))
+                    else:
+                        self.statusBar().showMessage(f"已保存场景: {os.path.basename(filename)}，并同步更新所有打开的XML")
             else:
                 QMessageBox.warning(self, "保存错误", "无法保存场景文件。")
     
@@ -429,16 +524,22 @@ class MainWindow(QMainWindow):
                 self._save_file()
                 # 保存完成后清理历史记录
                 self.control_viewmodel.clear_history()
+                if hasattr(self.scene_viewmodel, 'clear_gs_backups'):
+                    self.scene_viewmodel.clear_gs_backups()
                 event.accept()
             elif reply == QMessageBox.Discard:
                 # 不保存但仍需清理历史记录
                 self.control_viewmodel.clear_history()
+                if hasattr(self.scene_viewmodel, 'clear_gs_backups'):
+                    self.scene_viewmodel.clear_gs_backups()
                 event.accept()
             else:
                 event.ignore()
         else:
             # 没有几何体也需要清理历史记录
             self.control_viewmodel.clear_history()
+            if hasattr(self.scene_viewmodel, 'clear_gs_backups'):
+                self.scene_viewmodel.clear_gs_backups()
             event.accept()
 
 def main():

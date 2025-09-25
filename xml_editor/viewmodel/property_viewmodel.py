@@ -4,7 +4,10 @@
 作为属性视图和模型层之间的桥梁，处理属性相关的业务逻辑。
 """
 
+import numpy as np
 from PyQt5.QtCore import QObject, pyqtSignal
+
+from ..model.xml_parser import XMLParser
 from ..viewmodel.scene_viewmodel import SceneViewModel
 class PropertyViewModel(QObject):
     """
@@ -17,6 +20,15 @@ class PropertyViewModel(QObject):
     
     # 添加新的信号
     propertyChanged = pyqtSignal(object, str, object)  # 属性变化信号（对象、属性名、新值）
+    PHYSICS_ATTRS = [
+        "condim", "friction", "solimp", "solref", "solmix", "margin", "gap",
+        "density", "mass", "stiffness", "damping", "viscosity", "diaginertia",
+        "contact", "priority"
+    ]
+    JOINT_EXTRA_ATTRS = [
+        "range", "damping", "stiffness", "springref", "springstiff",
+        "frictionloss", "armature", "ref", "margin"
+    ]
     
     def __init__(self, scene_model:SceneViewModel):
         """
@@ -117,7 +129,57 @@ class PropertyViewModel(QObject):
         # 材质属性
         elif property_name == "material_color":
             return self._selected_object.material.color
-        
+        elif property_name == "mesh_scale":
+            if self.is_mesh_scale_editable():
+                return getattr(self._selected_object, "mesh_asset_scale", None)
+            return None
+        elif property_name == "mesh_scale_x":
+            scale = self.get_property("mesh_scale")
+            return scale[0] if scale is not None else None
+        elif property_name == "mesh_scale_y":
+            scale = self.get_property("mesh_scale")
+            return scale[1] if scale is not None else None
+        elif property_name == "mesh_scale_z":
+            scale = self.get_property("mesh_scale")
+            return scale[2] if scale is not None else None
+        elif property_name == "physics_attrs":
+            return self.get_physics_attributes()
+        elif property_name.startswith("physics_attr_"):
+            attrs = self.get_physics_attributes()
+            key = property_name[len("physics_attr_"):]
+            return attrs.get(key)
+        elif property_name == "joint_type":
+            joint_type = getattr(self._selected_object, 'joint_type', None)
+            if not joint_type:
+                attrs = getattr(self._selected_object, 'joint_attrs', {}) or {}
+                joint_type = attrs.get('type')
+            return (joint_type or "hinge").lower()
+        elif property_name == "joint_length":
+            length = getattr(self._selected_object, 'joint_length', None)
+            if length is not None:
+                return length
+            size = getattr(self._selected_object, 'size', None)
+            if size is None or len(size) == 0:
+                return None
+            return float(size[0]) * 2.0
+        elif property_name == "joint_axis":
+            return getattr(self._selected_object, 'joint_axis', None)
+        elif property_name == "joint_axis_x":
+            axis = getattr(self._selected_object, 'joint_axis', None)
+            return axis[0] if axis else None
+        elif property_name == "joint_axis_y":
+            axis = getattr(self._selected_object, 'joint_axis', None)
+            return axis[1] if axis else None
+        elif property_name == "joint_axis_z":
+            axis = getattr(self._selected_object, 'joint_axis', None)
+            return axis[2] if axis else None
+        elif property_name == "joint_attrs":
+            return self.get_joint_attributes()
+        elif property_name.startswith("joint_attr_"):
+            attrs = self.get_joint_attributes()
+            key = property_name[len("joint_attr_"):]
+            return attrs.get(key)
+
         return None
     
     def set_property(self, property_name, value):
@@ -146,6 +208,7 @@ class PropertyViewModel(QObject):
         
         # 变换属性
         elif property_name.startswith("position"):
+            # 从当前坐标复制一份，按需更新单个分量，避免覆盖未修改的轴
             position = list(self._selected_object.position)
             
             if property_name == "position":
@@ -173,6 +236,131 @@ class PropertyViewModel(QObject):
             
             self._selected_object.rotation = rotation
         
+        elif property_name == "joint_type":
+            if not isinstance(value, str):
+                return False
+            jt = value.strip().lower()
+            if jt not in ("hinge", "slide"):
+                return False
+            self._selected_object.joint_type = jt
+            if not hasattr(self._selected_object, 'joint_attrs') or not isinstance(self._selected_object.joint_attrs, dict):
+                self._selected_object.joint_attrs = {}
+            self._selected_object.joint_attrs['type'] = jt
+            # 依据类型切换默认渲染颜色，便于快速区分
+            if hasattr(self._selected_object, 'material') and hasattr(self._selected_object.material, 'color'):
+                self._selected_object.material.color = (1.0, 0.9, 0.2, 1.0) if jt == 'hinge' else (0.4, 0.8, 1.0, 1.0)
+            self.propertyChanged.emit(self._selected_object, property_name, jt)
+            self._scene_model.notify_object_changed(self._selected_object)
+            return True
+
+        elif property_name == "joint_length":
+            try:
+                length = float(value)
+            except Exception:
+                return False
+            length = max(length, 1e-5)
+            size = list(getattr(self._selected_object, 'size', [length * 0.5, 0.015, 0.015]))
+            if len(size) < 3:
+                size += [0.015] * (3 - len(size))
+            size[0] = length * 0.5
+            # 保证厚度非零，避免可视化与拾取失效
+            if abs(size[1]) < 1e-6:
+                size[1] = 0.015
+            if abs(size[2]) < 1e-6:
+                size[2] = 0.015
+            self._selected_object.size = size
+            self._selected_object.joint_length = length
+            # 若原始XML携带自定义长度字段则同步更新
+            if hasattr(self._selected_object, 'joint_attrs') and isinstance(self._selected_object.joint_attrs, dict):
+                if 'length' in self._selected_object.joint_attrs:
+                    self._selected_object.joint_attrs['length'] = f"{length:g}"
+            self.propertyChanged.emit(self._selected_object, property_name, length)
+            self._scene_model.notify_object_changed(self._selected_object)
+            return True
+
+        elif property_name.startswith("joint_axis"):
+            axis = list(getattr(self._selected_object, 'joint_axis', [1.0, 0.0, 0.0]))
+            if property_name == "joint_axis":
+                axis = list(value)
+            else:
+                try:
+                    comp = float(value)
+                except Exception:
+                    return False
+                if property_name.endswith("_x"):
+                    axis[0] = comp
+                elif property_name.endswith("_y"):
+                    axis[1] = comp
+                elif property_name.endswith("_z"):
+                    axis[2] = comp
+            axis_np = np.array(axis, dtype=float)
+            norm = float(np.linalg.norm(axis_np))
+            if norm < 1e-6:
+                return False
+            axis_unit = (axis_np / norm).tolist()
+            axis_unit = [0.0 if abs(c) < 1e-8 else c for c in axis_unit]
+            self._selected_object.joint_axis = axis_unit
+            euler = XMLParser._axis_to_euler(axis_unit)
+            self._selected_object.rotation = euler
+            if not hasattr(self._selected_object, 'joint_attrs') or not isinstance(self._selected_object.joint_attrs, dict):
+                self._selected_object.joint_attrs = {}
+            self._selected_object.joint_attrs['axis'] = " ".join(f"{float(c):g}" for c in axis_unit)
+            self.propertyChanged.emit(self._selected_object, "joint_axis", axis_unit)
+            self._scene_model.notify_object_changed(self._selected_object)
+            return True
+
+        elif property_name.startswith("joint_attr_"):
+            attr_name = property_name[len("joint_attr_"):]
+            if not hasattr(self._selected_object, 'joint_attrs') or not isinstance(self._selected_object.joint_attrs, dict):
+                self._selected_object.joint_attrs = {}
+            attrs = self._selected_object.joint_attrs
+            text = "" if value is None else str(value).strip()
+
+            store_text = text
+            if attr_name in ("range", "ref") and text:
+                joint_type = getattr(self._selected_object, 'joint_type', '').lower()
+                if joint_type == 'hinge':
+                    parts = text.split()
+                    try:
+                        nums = [float(p) for p in parts]
+                        rad_nums = [np.radians(n) for n in nums]  # UI 输入角度，内部存弧度
+                        store_text = " ".join(f"{num:.12g}" for num in rad_nums)
+                        setattr(self._selected_object, 'joint_angle_mode', 'radian')
+                    except Exception:
+                        store_text = text
+
+            attrs[attr_name] = store_text
+            self.propertyChanged.emit(self._selected_object, property_name, value)
+            self._scene_model.notify_object_changed(self._selected_object)
+            return True
+
+        elif property_name.startswith("mesh_scale"):
+            if not self.is_mesh_scale_editable():
+                return False
+            scale = list(getattr(self._selected_object, 'mesh_asset_scale', [1.0, 1.0, 1.0]))
+            if property_name == "mesh_scale":
+                scale = value
+            elif property_name == "mesh_scale_x":
+                scale[0] = value
+            elif property_name == "mesh_scale_y":
+                scale[1] = value
+            elif property_name == "mesh_scale_z":
+                scale[2] = value
+            self._scene_model.update_mesh_asset_scale(self._selected_object, scale)
+            self.propertyChanged.emit(self._selected_object, property_name, value)
+            return True
+
+        elif property_name.startswith("physics_attr_"):
+            attr_name = property_name[len("physics_attr_"):]
+            if not hasattr(self._selected_object, 'mjcf_attrs') or not isinstance(self._selected_object.mjcf_attrs, dict):
+                self._selected_object.mjcf_attrs = {}
+            attrs = self._selected_object.mjcf_attrs
+            text = "" if value is None else str(value).strip()
+            attrs[attr_name] = text
+            self.propertyChanged.emit(self._selected_object, property_name, value)
+            self._scene_model.notify_object_changed(self._selected_object)
+            return True
+
         elif property_name.startswith("scale"):
             size = list(self._selected_object.size)
             
@@ -213,6 +401,53 @@ class PropertyViewModel(QObject):
                 self._scene_model.hierarchyViewModel.hierarchyChanged.emit()
         
         return True
+
+    def is_mesh_scale_editable(self):
+        """透传给 SceneViewModel，判断当前选中 mesh 是否支持资产缩放编辑"""
+        if self._selected_object is None:
+            return False
+        if hasattr(self._scene_model, 'is_mesh_scale_editable'):
+            return self._scene_model.is_mesh_scale_editable(self._selected_object)
+        return False
+
+    def get_physics_attributes(self):
+        if self._selected_object is None:
+            return {}
+        attrs = getattr(self._selected_object, 'mjcf_attrs', {}) or {}
+        if not isinstance(attrs, dict):
+            return {}
+        result = {}
+        for key in self.PHYSICS_ATTRS:
+            if key in attrs:
+                result[key] = attrs[key]
+        return result
+
+    def get_joint_attributes(self):
+        if self._selected_object is None:
+            return {}
+        attrs = getattr(self._selected_object, 'joint_attrs', {}) or {}
+        if not isinstance(attrs, dict):
+            return {}
+        result = {}
+        for key in self.JOINT_EXTRA_ATTRS:
+            if key not in attrs or attrs[key] is None:
+                continue
+            text = str(attrs[key]).strip()
+            if not text:
+                result[key] = ""
+                continue
+            if key in ("range", "ref"):
+                joint_type = getattr(self._selected_object, 'joint_type', '').lower()
+                if joint_type == 'hinge':
+                    parts = text.split()
+                    try:
+                        nums = [float(p) for p in parts]
+                        deg_nums = [np.degrees(n) for n in nums]  # 存储用弧度，界面展示角度
+                        text = " ".join(f"{num:g}" for num in deg_nums)
+                    except Exception:
+                        pass
+            result[key] = text
+        return result
     
     def reset_properties(self):
         """

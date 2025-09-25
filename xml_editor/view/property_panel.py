@@ -4,7 +4,7 @@
 包装属性视图(PropertyView)用于显示在停靠面板中。
 """
 
-from PyQt5.QtWidgets import QWidget, QVBoxLayout
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QScrollArea
 
 from .property_view import PropertyView
 
@@ -29,9 +29,13 @@ class PropertyPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # 创建属性视图并添加到布局中
+        # 创建属性视图并放入滚动区域
         self.property_view = PropertyView(property_viewmodel)
-        layout.addWidget(self.property_view)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(self.property_view)
+        layout.addWidget(scroll)
         
-        # 将属性视图的propertyChanged信号转发到视图模型
+        # 将属性视图的 propertyChanged 信号直接交给视图模型处理，形成 UI→ViewModel 的通道
         self.property_view.propertyChanged.connect(property_viewmodel.set_property) 
