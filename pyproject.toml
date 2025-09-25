@@ -21,4 +21,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["xml_editor"] 
+packages = ["mjcf_editor"] 

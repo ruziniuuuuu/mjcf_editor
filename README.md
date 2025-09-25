@@ -59,7 +59,7 @@
 ### 启动程序
 
 ```
-python -m xml_editor.main
+python -m mjcf_editor.main
 ```
 
 ### 基本操作
@@ -197,18 +197,18 @@ HierarchyTree  ControlPanel    PropertyPanel  <----------------------------+
 
 ## 类的职责
 
-### 模型层 (`xml_editor.model`)
+### 模型层 (`mjcf_editor.model`)
 - `geometry.py`: 定义几何体 (`Geometry`, `GeometryGroup`, `BaseGeometry`)、材质 (`Material`) 及相关枚举 (`GeometryType`, `OperationMode`) 的核心数据结构和基础变换。
 - `xml_parser.py`: 处理 MuJoCo XML 文件的加载和保存逻辑。
 - `raycaster.py`: 实现从屏幕坐标到3D世界的光线投射，用于对象拾取。
 
-### 视图模型层 (`xml_editor.viewmodel`)
+### 视图模型层 (`mjcf_editor.viewmodel`)
 - `scene_viewmodel.py`: 管理整个场景的状态，包括几何体列表、当前选择、摄像机配置、射线投射器实例；处理场景级别操作（加载/保存数据、创建/删除对象、选择）。是多个其他 ViewModel 依赖的核心。
 - `property_viewmodel.py`: 管理属性面板的状态，获取和设置当前选中对象的属性，并在属性变化时通知视图。依赖 `SceneViewModel` 获取选择和对象变化。
 - `hierarchy_viewmodel.py`: 管理层级树的状态，处理对象的父子关系、分组、复制/粘贴等层级相关操作。依赖 `SceneViewModel` 获取几何体列表和变化。
 - `control_viewmodel.py`: 管理控制面板的状态，处理操作模式（平移/旋转/缩放/观察）、坐标系切换以及场景JSON存档的保存和加载逻辑。依赖 `SceneViewModel` 获取和设置操作模式及存档数据。
 
-### 视图层 (`xml_editor.view`)
+### 视图层 (`mjcf_editor.view`)
 - `main.py` (`MainWindow`): 主应用窗口，继承自 `QMainWindow`，负责组合所有视图组件（停靠窗口、菜单栏等）和初始化并连接视图模型与视图。
 - `opengl_view.py` (`OpenGLView`): 继承自 `QOpenGLWidget`，负责渲染3D场景、绘制Gizmo、处理鼠标/键盘交互以实现场景导航和对象操作，处理拖放创建。持有 `SceneViewModel`。
 - `property_panel.py` (`PropertyPanel`) / `property_view.py` (`PropertyView`): 属性面板，显示和编辑选中对象的属性。`PropertyPanel` 是包含 `PropertyView` 的容器。`PropertyView` 持有 `PropertyViewModel`。
